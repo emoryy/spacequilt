@@ -55,16 +55,19 @@ COL_MIN, COL_MAX = 130, 230
 
 
 class Node:
-    __slots__ = ("path", "size", "children", "parent")
+    __slots__ = ("path", "size", "children", "parent", "is_group")
 
-    def __init__(self, path, size):
+    def __init__(self, path, size, is_group=False):
         self.path = path
         self.size = size          # bytes, as reported by du (cumulative)
         self.children = []
         self.parent = None
+        self.is_group = is_group  # synthetic "N smaller items" aggregate
 
     @property
     def name(self):
+        if self.is_group:
+            return self.path      # groups store their label in .path
         base = os.path.basename(self.path.rstrip("/"))
         return base or self.path   # root ("/") keeps its full path
 
@@ -182,21 +185,49 @@ class IcicleWidget(QWidget):
         target = self.width() / 7.0
         return max(COL_MIN, min(COL_MAX, target))
 
-    def _layout(self, node, x, y, h, depth, base_hue, colw):
+    def _layout(self, node, x, y, h, depth, base_hue, colw, in_group):
         rect = QRectF(x, y, colw, h)
         self._blocks.append((rect, node, base_hue, depth))
-        if h < MIN_BLOCK_PX or not node.children or x + colw > self.width():
+        # Inside an already-aggregated group, pack children down to a 1px floor
+        # instead of re-aggregating, so a group never nests into itself.
+        floor = 1.0 if in_group else MIN_BLOCK_PX
+        if h < floor or not node.children or x + colw > self.width():
             return
         cy = y
         total = node.size or 1
-        for i, child in enumerate(node.children):
+        children = node.children
+        n = len(children)
+        i = 0
+        while i < n:
+            child = children[i]
             ch = h * (child.size / total)
-            if ch < MIN_BLOCK_PX:
-                break
+            if ch < floor:
+                break   # children are sorted desc, so the rest are tiny too
             # Direct children of the focus each get their own hue.
-            child_hue = (i / max(1, len(node.children))) if depth == 0 else base_hue
-            self._layout(child, x + colw, cy, ch, depth + 1, child_hue, colw)
+            child_hue = (i / max(1, n)) if depth == 0 else base_hue
+            self._layout(child, x + colw, cy, ch, depth + 1, child_hue, colw, in_group)
             cy += ch
+            i += 1
+
+        # Coalesce the too-small tail into one drillable aggregate block that
+        # fills the leftover band, instead of leaving it blank.
+        remaining = children[i:]
+        leftover_h = (y + h) - cy
+        if (
+            not in_group
+            and remaining
+            and leftover_h >= MIN_BLOCK_PX
+            and x + colw <= self.width()
+        ):
+            group = Node(
+                f"{len(remaining)} smaller items",
+                sum(c.size for c in remaining),
+                is_group=True,
+            )
+            group.children = remaining
+            group.parent = node
+            grect = QRectF(x + colw, cy, colw, leftover_h)
+            self._blocks.append((grect, group, base_hue, depth + 1))
 
     def _block_color(self, base_hue, depth, hovered):
         light = min(0.78, 0.42 + depth * 0.06)
@@ -205,6 +236,18 @@ class IcicleWidget(QWidget):
         if hovered:
             c = c.lighter(122)
         return c
+
+    @staticmethod
+    def _draw_label(p, rect, flags, text, fg):
+        """Draw text with a dark outline so it stays readable on any block."""
+        p.setPen(QColor(0, 0, 0, 235))
+        for dx, dy in (
+            (-1, -1), (0, -1), (1, -1), (-1, 0),
+            (1, 0), (-1, 1), (0, 1), (1, 1),
+        ):
+            p.drawText(rect.translated(dx, dy), flags, text)
+        p.setPen(fg)
+        p.drawText(rect, flags, text)
 
     # --- painting ---------------------------------------------------------
     def paintEvent(self, _event):
@@ -219,29 +262,41 @@ class IcicleWidget(QWidget):
 
         self._blocks = []
         colw = self._col_width()
-        self._layout(self.focus, 0.0, 0.0, float(self.height()), 0, 0.0, colw)
+        self._layout(
+            self.focus, 0.0, 0.0, float(self.height()), 0, 0.0, colw,
+            self.focus.is_group,
+        )
 
-        font = self.font()
-        fm = QFontMetrics(font)
+        fm = QFontMetrics(self.font())
         for rect, node, base_hue, depth in self._blocks:
             hovered = node is self.hovered
-            color = self._block_color(base_hue, depth, hovered)
-            p.fillRect(rect, color)
+            if node.is_group:
+                color = QColor.fromHslF(base_hue % 1.0, 0.05, 0.30)
+                if hovered:
+                    color = color.lighter(130)
+                p.fillRect(rect, color)
+                p.fillRect(rect, Qt.BDiagPattern)   # texture marks it as grouped
+            else:
+                color = self._block_color(base_hue, depth, hovered)
+                p.fillRect(rect, color)
             pen = QPen(QColor(0, 0, 0, 60))
             pen.setWidth(1)
             p.setPen(pen)
             p.drawRect(rect)
 
             if rect.height() >= fm.height() + 3 and rect.width() > 34:
-                text_dark = color.lightnessF() > 0.6
-                p.setPen(QColor("#101010") if text_dark else QColor("#f5f5f5"))
                 inner = rect.adjusted(6, 2, -6, -2)
-                name = fm.elidedText(node.name, Qt.ElideMiddle, int(inner.width()))
-                p.drawText(inner, Qt.AlignLeft | Qt.AlignTop, name)
+                label = node.name
+                if node.is_group:
+                    label = "▸ " + label
+                name = fm.elidedText(label, Qt.ElideMiddle, int(inner.width()))
+                self._draw_label(
+                    p, inner, Qt.AlignLeft | Qt.AlignTop, name, QColor("#ffffff")
+                )
                 if rect.height() >= 2 * fm.height() + 4:
-                    p.setPen(QColor("#303030") if text_dark else QColor("#d0d0d0"))
-                    p.drawText(
-                        inner, Qt.AlignLeft | Qt.AlignBottom, human(node.size)
+                    self._draw_label(
+                        p, inner, Qt.AlignLeft | Qt.AlignBottom,
+                        human(node.size), QColor("#e2e2e2"),
                     )
         p.end()
 
