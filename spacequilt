@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""spacequilt - a modern take on xdiskusage's icicle disk-usage view.
+
+Scans a directory with `du` (exactly the trick the original xdiskusage uses)
+and draws the result as horizontal, size-proportional columns. Click a block
+to drill into it; use the breadcrumb or Backspace to go back out.
+
+Usage:
+    spacequilt [PATH] [-x/--one-filesystem]
+
+  PATH               Directory to scan. Default: current directory.
+  -x, --one-filesystem   Do not cross filesystem boundaries (passes -x to du).
+
+Interaction:
+  Left click        Drill into the block under the cursor.
+  Breadcrumb / Backspace   Go up one level.
+  Right click       Context menu (open in file manager, copy path).
+  Ctrl+R            Rescan the current root.
+  Ctrl+O            Pick a new directory to scan.
+  Esc               Go up one level (quits at the root).
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
+
+from PySide6.QtCore import Qt, QRectF, QThread, Signal
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QGuiApplication,
+    QFont,
+    QFontMetrics,
+    QPainter,
+    QPen,
+)
+from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QLabel,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QWidget,
+)
+
+# Minimum on-screen height (px) for a block to be drawn / recursed into.
+MIN_BLOCK_PX = 2.0
+# Column width is clamped to this range; within it we aim for ~7 visible levels.
+COL_MIN, COL_MAX = 130, 230
+
+
+class Node:
+    __slots__ = ("path", "size", "children", "parent")
+
+    def __init__(self, path, size):
+        self.path = path
+        self.size = size          # bytes, as reported by du (cumulative)
+        self.children = []
+        self.parent = None
+
+    @property
+    def name(self):
+        base = os.path.basename(self.path.rstrip("/"))
+        return base or self.path   # root ("/") keeps its full path
+
+
+def human(size):
+    """Human-readable size, base 1024."""
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    s = float(size)
+    for u in units:
+        if s < 1024 or u == units[-1]:
+            return f"{s:.0f} {u}" if u == "B" else f"{s:.1f} {u}"
+        s /= 1024
+
+
+def build_tree(du_output):
+    """Turn `du -k --all` output into a Node tree; return the root Node."""
+    nodes = {}
+    last_path = None
+    for line in du_output.splitlines():
+        tab = line.find("\t")
+        if tab < 0:
+            continue
+        try:
+            size_kib = int(line[:tab])
+        except ValueError:
+            continue
+        path = line[tab + 1:]
+        nodes[path] = Node(path, size_kib * 1024)
+        last_path = path
+
+    if not nodes:
+        return None
+
+    for path, node in nodes.items():
+        parent_path = os.path.dirname(path.rstrip("/"))
+        parent = nodes.get(parent_path)
+        if parent is not None and parent is not node:
+            parent.children.append(node)
+            node.parent = parent
+
+    # Root = the deepest-listed node with no in-set parent (du prints it last).
+    root = nodes.get(last_path)
+    while root is not None and root.parent is not None:
+        root = root.parent
+    if root is None:
+        root = max(nodes.values(), key=lambda n: n.size)
+
+    for node in nodes.values():
+        node.children.sort(key=lambda n: n.size, reverse=True)
+    return root
+
+
+class Scanner(QThread):
+    done = Signal(object)          # emits root Node
+    failed = Signal(str)
+
+    def __init__(self, path, one_fs):
+        super().__init__()
+        self.path = path
+        self.one_fs = one_fs
+
+    def run(self):
+        cmd = ["du", "-k", "--all"]
+        if self.one_fs:
+            cmd.append("-x")
+        cmd.append(self.path)
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, errors="replace"
+            )
+        except OSError as exc:
+            self.failed.emit(str(exc))
+            return
+        root = build_tree(proc.stdout)
+        if root is None:
+            msg = proc.stderr.strip() or "du returned no usable output."
+            self.failed.emit(msg)
+        else:
+            self.done.emit(root)
+
+
+class IcicleWidget(QWidget):
+    focus_changed = Signal(object)   # emits the new focus Node
+
+    def __init__(self):
+        super().__init__()
+        self.setMouseTracking(True)
+        self.root = None
+        self.focus = None
+        self.hovered = None
+        self._blocks = []            # (QRectF, node, base_hue, depth)
+        self.setMinimumSize(480, 320)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def set_root(self, root):
+        self.root = root
+        self.set_focus(root)
+
+    def set_focus(self, node):
+        if node is None:
+            return
+        self.focus = node
+        self.hovered = None
+        self.focus_changed.emit(node)
+        self.update()
+
+    def go_up(self):
+        if self.focus is not None and self.focus.parent is not None:
+            self.set_focus(self.focus.parent)
+            return True
+        return False
+
+    # --- layout -----------------------------------------------------------
+    def _col_width(self):
+        target = self.width() / 7.0
+        return max(COL_MIN, min(COL_MAX, target))
+
+    def _layout(self, node, x, y, h, depth, base_hue, colw):
+        rect = QRectF(x, y, colw, h)
+        self._blocks.append((rect, node, base_hue, depth))
+        if h < MIN_BLOCK_PX or not node.children or x + colw > self.width():
+            return
+        cy = y
+        total = node.size or 1
+        for i, child in enumerate(node.children):
+            ch = h * (child.size / total)
+            if ch < MIN_BLOCK_PX:
+                break
+            # Direct children of the focus each get their own hue.
+            child_hue = (i / max(1, len(node.children))) if depth == 0 else base_hue
+            self._layout(child, x + colw, cy, ch, depth + 1, child_hue, colw)
+            cy += ch
+
+    def _block_color(self, base_hue, depth, hovered):
+        light = min(0.78, 0.42 + depth * 0.06)
+        sat = 0.15 if depth == 0 else 0.48
+        c = QColor.fromHslF(base_hue % 1.0, sat, light)
+        if hovered:
+            c = c.lighter(122)
+        return c
+
+    # --- painting ---------------------------------------------------------
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        p.fillRect(self.rect(), QColor("#1e1f22"))
+
+        if self.focus is None:
+            p.setPen(QColor("#888"))
+            p.drawText(self.rect(), Qt.AlignCenter, "No data.")
+            return
+
+        self._blocks = []
+        colw = self._col_width()
+        self._layout(self.focus, 0.0, 0.0, float(self.height()), 0, 0.0, colw)
+
+        font = self.font()
+        fm = QFontMetrics(font)
+        for rect, node, base_hue, depth in self._blocks:
+            hovered = node is self.hovered
+            color = self._block_color(base_hue, depth, hovered)
+            p.fillRect(rect, color)
+            pen = QPen(QColor(0, 0, 0, 60))
+            pen.setWidth(1)
+            p.setPen(pen)
+            p.drawRect(rect)
+
+            if rect.height() >= fm.height() + 3 and rect.width() > 34:
+                text_dark = color.lightnessF() > 0.6
+                p.setPen(QColor("#101010") if text_dark else QColor("#f5f5f5"))
+                inner = rect.adjusted(6, 2, -6, -2)
+                name = fm.elidedText(node.name, Qt.ElideMiddle, int(inner.width()))
+                p.drawText(inner, Qt.AlignLeft | Qt.AlignTop, name)
+                if rect.height() >= 2 * fm.height() + 4:
+                    p.setPen(QColor("#303030") if text_dark else QColor("#d0d0d0"))
+                    p.drawText(
+                        inner, Qt.AlignLeft | Qt.AlignBottom, human(node.size)
+                    )
+        p.end()
+
+    # --- hit testing / interaction ---------------------------------------
+    def _node_at(self, pos):
+        for rect, node, _hue, _depth in self._blocks:
+            if rect.contains(pos):
+                return node
+        return None
+
+    def mouseMoveEvent(self, event):
+        node = self._node_at(event.position())
+        if node is not self.hovered:
+            self.hovered = node
+            if node is not None:
+                self.setToolTip(f"{node.path}\n{human(node.size)}")
+            else:
+                self.setToolTip("")
+            self.update()
+
+    def mousePressEvent(self, event):
+        node = self._node_at(event.position())
+        if node is None:
+            return
+        if event.button() == Qt.LeftButton:
+            if node is self.focus:
+                self.go_up()
+            elif node.children:
+                self.set_focus(node)
+        elif event.button() == Qt.RightButton:
+            self._context_menu(node, event.globalPosition().toPoint())
+
+    def _context_menu(self, node, global_pos):
+        menu = QMenu(self)
+        folder = node.path if node.children else os.path.dirname(node.path)
+        act_open = QAction("Open in file manager", self)
+        act_open.triggered.connect(lambda: _open_folder(folder))
+        act_copy = QAction("Copy path", self)
+        act_copy.triggered.connect(
+            lambda: QGuiApplication.clipboard().setText(node.path)
+        )
+        menu.addAction(act_open)
+        menu.addAction(act_copy)
+        menu.exec(global_pos)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key in (Qt.Key_Backspace, Qt.Key_Escape):
+            if not self.go_up() and key == Qt.Key_Escape:
+                self.window().close()
+        else:
+            super().keyPressEvent(event)
+
+
+def _open_folder(path):
+    try:
+        subprocess.Popen(["xdg-open", path])
+    except OSError:
+        pass
+
+
+class Breadcrumb(QWidget):
+    """A row of clickable buttons for the path from root to focus."""
+
+    def __init__(self, icicle):
+        super().__init__()
+        self.icicle = icicle
+        from PySide6.QtWidgets import QHBoxLayout
+
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(6, 4, 6, 4)
+        self._layout.setSpacing(2)
+        self._layout.addStretch()
+
+    def rebuild(self, focus):
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        chain = []
+        node = focus
+        while node is not None:
+            chain.append(node)
+            node = node.parent
+        chain.reverse()
+        for i, node in enumerate(chain):
+            btn = QPushButton(node.name or "/")
+            btn.setFlat(True)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _=False, n=node: self.icicle.set_focus(n))
+            self._layout.addWidget(btn)
+            if i < len(chain) - 1:
+                sep = QLabel("›")
+                sep.setStyleSheet("color:#777;")
+                self._layout.addWidget(sep)
+        self._layout.addStretch()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, path, one_fs):
+        super().__init__()
+        self.one_fs = one_fs
+        self.scanner = None
+        self.setWindowTitle("spacequilt")
+        self.resize(1000, 640)
+
+        self.icicle = IcicleWidget()
+        self.breadcrumb = Breadcrumb(self.icicle)
+        self.icicle.focus_changed.connect(self._on_focus)
+
+        central = QWidget()
+        from PySide6.QtWidgets import QVBoxLayout
+
+        v = QVBoxLayout(central)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+        v.addWidget(self.breadcrumb)
+        v.addWidget(self.icicle, 1)
+        self.setCentralWidget(central)
+
+        tb = self.addToolBar("main")
+        tb.setMovable(False)
+        act_open = QAction("Open…", self)
+        act_open.setShortcut("Ctrl+O")
+        act_open.triggered.connect(self._pick_dir)
+        act_rescan = QAction("Rescan", self)
+        act_rescan.setShortcut("Ctrl+R")
+        act_rescan.triggered.connect(self._rescan)
+        tb.addAction(act_open)
+        tb.addAction(act_rescan)
+
+        self.statusBar().showMessage("Ready.")
+        self.scan(path)
+
+    def _on_focus(self, node):
+        self.breadcrumb.rebuild(node)
+        self.statusBar().showMessage(f"{node.path}    {human(node.size)}")
+
+    def scan(self, path):
+        path = os.path.abspath(path)
+        if not os.path.isdir(path):
+            QMessageBox.warning(self, "spacequilt", f"Not a directory:\n{path}")
+            return
+        self._current_path = path
+        self.statusBar().showMessage(f"Scanning {path} …")
+        self.setEnabled(True)
+        self.scanner = Scanner(path, self.one_fs)
+        self.scanner.done.connect(self._on_scan_done)
+        self.scanner.failed.connect(self._on_scan_failed)
+        self.scanner.start()
+
+    def _on_scan_done(self, root):
+        self.icicle.set_root(root)
+        self.statusBar().showMessage(f"{root.path}    {human(root.size)}")
+
+    def _on_scan_failed(self, msg):
+        QMessageBox.critical(self, "spacequilt", f"Scan failed:\n{msg}")
+        self.statusBar().showMessage("Scan failed.")
+
+    def _rescan(self):
+        self.scan(self._current_path)
+
+    def _pick_dir(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Choose a directory to scan", self._current_path
+        )
+        if path:
+            self.scan(path)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="spacequilt", description="Icicle disk-usage viewer."
+    )
+    parser.add_argument("path", nargs="?", default=".", help="Directory to scan.")
+    parser.add_argument(
+        "-x",
+        "--one-filesystem",
+        action="store_true",
+        help="Do not cross filesystem boundaries (du -x).",
+    )
+    args = parser.parse_args()
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("spacequilt")
+    win = MainWindow(args.path, args.one_filesystem)
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
