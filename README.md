@@ -1,21 +1,25 @@
 # SpaceQuilt
 
-A modern, minimal disk-usage viewer with two classic visualisations that
-nothing on Linux carries forward today:
+SpaceQuilt shows disk usage in two views that no current Linux tool offers:
 
-- the **icicle** view of [xdiskusage](https://xdiskusage.sourceforge.net/):
-  horizontal, size-proportional columns you click to drill into (the same
-  interaction model as the Android *DiskUsage* app);
-- the **boxes** view of SpaceMonger: every directory a titled box with its
-  children packed inside, recursively, so a whole volume reads as one nested
-  map.
+- **Boxes**, after SpaceMonger: each directory is a titled box, with its
+  children packed inside it, down to the files. You see a whole volume as one
+  nested map.
+- **Icicle**, after [xdiskusage](https://xdiskusage.sourceforge.net/):
+  columns sized by bytes, one per depth. You click a block to drill into it,
+  as in the Android *DiskUsage* app.
 
-Both share the tree, colours, drill-down and zoom, and switch live. Built on
-Qt6 (PySide6) so it looks and themes like a current desktop app.
+![Boxes view of a home directory](docs/boxes.png)
 
-Like the original xdiskusage, it doesn't implement its own filesystem walker,
-it parses the output of `du` (`du -k --all`), which is fast, correct, and
-already handles the awkward parts (hardlinks, sparse files, block accounting).
+![Icicle view of the same directory](docs/icicle.png)
+
+The two views share the scan, the colours, drill-down and zoom, and you can
+switch between them at any time. SpaceQuilt runs on Qt6 (PySide6) and follows
+your desktop theme.
+
+SpaceQuilt has no filesystem walker of its own. Like xdiskusage, it reads the
+output of `du -k --all`, and `du` takes care of hardlinks, sparse files and
+block accounting.
 
 ## Requirements
 
@@ -26,58 +30,112 @@ already handles the awkward parts (hardlinks, sparse files, block accounting).
 ## Usage
 
 ```sh
-spacequilt [PATH] [-X/--cross-filesystems] [--colors SCHEME]
+spacequilt [PATH] [-x | -X] [--view VIEW] [--colors SCHEME] [--style STYLE]
 ```
 
-- `PATH`: directory to scan. Without it the window opens on a page listing
-  the mounted volumes (device, filesystem, usage bar) and recent scans, with a
-  *Browse for a folder…* button for anything else; *Open…* (Ctrl+O) brings
-  that page back at any time
-- `-x`, `--one-filesystem`: stop at mount points (`du -x`). **This is the
-  default**, so scanning `/` measures the root filesystem itself instead of
-  descending into every mounted disk, `/proc`, `/sys` and so on.
-- `-X`, `--cross-filesystems`: descend into other mounted filesystems too
-- `--view icicle|boxes`: start in the icicle columns or the SpaceMonger-style
-  nested boxes; remembered, and the toolbar buttons (Ctrl+1 / Ctrl+2) switch
-  live, keeping the current focus
-- `--colors branches|levels|rainbow`: colour scheme; the choice is
-  remembered, and the toolbar's *Colors* menu switches it live
-- `--style flat|raised|deep`: relief of the blocks. *Raised* (default) gives a
-  light top/left edge, a dark bottom/right edge, a soft gradient and, in the
-  boxes view, sunken content areas, a nod to SpaceMonger's tiles; *deep* is
-  the same twice as strong. Remembered too; the toolbar's *Style* menu is the
-  same switch
+- `PATH`: the directory to scan. Without it, SpaceQuilt opens on a page that
+  lists the mounted volumes with their usage and your recent scans. A
+  *Browse for a folder…* button covers anything else. *Open…* (Ctrl+O) brings
+  the page back.
+- `-x`, `--one-filesystem` (default): stop at mount points (`du -x`). A scan
+  of `/` then measures the root filesystem alone, without the other disks,
+  `/proc` or `/sys`.
+- `-X`, `--cross-filesystems`: descend into every filesystem mounted below
+  `PATH`.
+- `--view boxes|icicle`: the view to start in. Boxes is the default.
+- `--colors branches|levels|rainbow`: the colour scheme of the starting view.
+  Each view keeps its own scheme: boxes starts with *levels*, icicle with
+  *branches*.
+- `--style flat|raised|deep`: the relief of the blocks. *Raised* (default)
+  adds a light top and left edge, a dark bottom and right edge, a soft
+  gradient and, in the boxes view, sunken content areas. *Deep* doubles all
+  of it.
 
-Window size, maximised state and screen are remembered between runs.
+SpaceQuilt remembers the view, the schemes, the style, the window size and
+the maximised state between runs. The toolbar changes each of them live.
 
 ### Colour schemes
 
 | Scheme | Look |
 | --- | --- |
-| `branches` (default) | Each top-level entry of the focused node gets its own hue; deeper levels inherit it and get lighter, with a small per-path lightness jitter so siblings stay distinguishable |
-| `levels` | SpaceMonger's flat pastels: one colour per depth (counted from the scanned root), cycling salmon, yellow, green, cyan, lavender, magenta, grey |
-| `rainbow` | Every level spreads the hues over the wheel again, starting at the parent's hue, so the largest child matches its parent and its siblings fan out from there |
+| `levels` (boxes default) | SpaceMonger's flat pastels: one colour per depth from the scanned root, cycling salmon, yellow, green, cyan, lavender, magenta and grey |
+| `branches` (icicle default) | Each top-level entry of the focused directory gets its own hue. Deeper levels keep the hue and get lighter, with a small per-path shift so neighbouring siblings differ |
+| `rainbow` | Each level spreads the hues around the wheel again. The largest child takes its parent's hue and its siblings fan out from it |
 
-The `N smaller items` blocks are the unresolved part of their branch and
-look like it: the branch's colour, slightly muted, under a dot stipple, the
-way SpaceMonger 2 drew what was too small to lay out.
+The defaults differ per view. In the boxes view, nesting hides how deep a box
+sits, so the colour shows the level. In the icicle view the column
+gives the depth, so the colour shows the top-level branch.
 
-The toolbar has a *One filesystem* toggle (Ctrl+M) that flips this and
-rescans, so a single window can switch between "this drive only" and
-"everything under this path".
+### Scanning
 
-While `du` runs, an overlay shows how many entries have been read and which
-directory is being walked. The bar is a real percentage when a target is
-known: the volume's used inode count for a mount-point scan, or the entry
-count of the previous scan of the same path (remembered between runs).
-Otherwise it sweeps indeterminately. On a rescan the old tree stays visible,
-dimmed, under the overlay.
+While `du` runs, a panel shows how many entries SpaceQuilt has read and which
+directory `du` is in, with a Cancel button (Esc does the same). The bar shows
+a percentage when SpaceQuilt knows the total: the used inode count of the
+volume for a mount-point scan, or the entry count of your last scan of that
+path. Otherwise it sweeps. On a rescan, the old tree stays on screen, dimmed.
 
-When the scanned path is a mount point (and the scan stays on one
-filesystem), the tree is wrapped in a *disk* node: the first column shows the
-device, and next to the scanned directory a **Free space** block shows what
-the volume has left, SpaceMonger style. The status bar then reports total,
-used and free space for the volume.
+When you scan a mount point on one filesystem, the device becomes the
+outermost block, and a **Free space** block sits next to the scanned
+directory, as in SpaceMonger. The status bar then shows the volume's total,
+used and free space.
+
+The *One filesystem* toolbar button (Ctrl+M) switches between `-x` and `-X`.
+It asks before it rescans.
+
+### Boxes view
+
+A directory gets a title bar with its name and size when it has room.
+SpaceQuilt packs its children inside with a squarified treemap. Files and
+small directories get a centred label.
+
+SpaceQuilt lays out each directory once and places every entry in it. When
+you zoom, it scales that layout and moves nothing. The screen size decides
+which boxes appear. Entries too small to draw show as the parent's
+dotted area, the way SpaceMonger 2 drew them, and appear one by one as you
+zoom in. SpaceQuilt draws at most a few thousand boxes per frame, which keeps
+a large screen fluid.
+
+### Icicle view
+
+Each column holds one depth, and a block's height follows its size. Entries
+too small to draw at the current zoom merge into an `N smaller items` block
+in their branch's colour under a dot pattern. Zoom in and it splits up.
+Double click it to open it on its own.
+
+### Interaction
+
+| Action | Result |
+| --- | --- |
+| Wheel | Zoom around the cursor |
+| Shift + wheel | Icicle: zoom sizes only |
+| Ctrl + wheel | Icicle: zoom depth only |
+| Drag (left or middle button) | Pan |
+| Click a block | Select it; the status bar shows its path and size |
+| Double click a block | Drill into it (double click the focused block to go up) |
+| Breadcrumb button | Jump to that ancestor |
+| Backspace / Esc | Go up one level |
+| Esc during a scan, Cancel, Stop | Cancel the scan and keep the previous tree |
+| 0 / Ctrl+0 | Fit the focused directory to the window |
+| Ctrl+1 / Ctrl+2 | Icicle / boxes view |
+| Ctrl+O | Volumes, recent scans, browse |
+| Ctrl+R | Rescan |
+| Ctrl+M | One filesystem on or off (rescans) |
+| Right click | Open in file manager, copy path |
+
+Zoom runs from the fit inward, and panning stops at the edge of the content.
+SpaceQuilt lays out the blocks in screen pixels on each frame, so zooming in
+reveals deeper levels instead of magnifying the drawn ones. Drill-down and
+fit animate: the view zooms until the block fills the window, then the focus
+switches. Going up plays the motion in reverse.
+
+### Screenshots
+
+`docs/screenshots.py` renders the images above offscreen from a made-up home
+directory, at the width of a GitHub README. Run it after UI changes:
+
+```sh
+python3 docs/screenshots.py
+```
 
 ### Desktop integration
 
@@ -85,54 +143,14 @@ used and free space for the volume.
 ./install-desktop.sh            # undo with --uninstall
 ```
 
-Installs a `.desktop` entry and symlinks `spacequilt.svg` into the icon theme,
-both pointing back at this checkout. Wayland compositors resolve a window's
-icon through its desktop id rather than from the window itself, so without the
-entry the task bar falls back to a generic placeholder. The entry also
-registers `inode/directory`, so folders get a *Open with SpaceQuilt* action.
-
-### Interaction
-
-| Action | Result |
-| --- | --- |
-| Wheel | Zoom continuously around the cursor |
-| Shift + wheel | Icicle: zoom vertically only (sizes) |
-| Ctrl + wheel | Icicle: zoom horizontally only (depth) |
-| Ctrl+1 / Ctrl+2 | Switch to the icicle / boxes view |
-| Drag (left or middle) | Pan the view |
-| Left click a block | Select it (path and size go to the status bar) |
-| Double click a block | Drill into it, animated (double click the focused column to go up) |
-| 0 / Ctrl+0 | Fit the view back to the focused node (animated) |
-| Breadcrumb button | Jump to that ancestor |
-| Backspace / Esc | Go up one level |
-| Esc during a scan / Cancel or Stop button | Cancel the scan; whatever was shown before stays |
-| Ctrl+O | Volumes / recent / browse page |
-| Right click | Open in file manager / copy path |
-| Ctrl+R | Rescan |
-| Ctrl+O | Pick another directory |
-| Ctrl+M | Toggle staying on one filesystem (rescans) |
-
-In the boxes view a directory shows a title bar (name left, size right) when
-there is room, and its children are packed inside by a squarified treemap;
-files and too-small directories get a centred label. Each directory's layout
-gives every entry its place and is decided once; zooming only scales it, so
-nothing rearranges as you zoom: the screen size decides what is drawn, not
-where it goes. Whatever is too small to draw shows as the parent's dotted
-area, the way SpaceMonger 2 drew unresolved content, and resolves entry by
-entry as you zoom in. The smallest boxes are capped at a few thousand per
-frame, so the map stays fluid on a large screen.
-
-Zooming out stops at the fit, and panning stops where the content ends: below
-the fit or beyond the edge there is nothing more to see. Zoom is
-continuous, not a set of discrete levels: the layout is recomputed in
-screen pixels every frame, so zooming in genuinely subdivides deeper levels
-(and breaks up the `N smaller items` aggregate blocks) instead of magnifying
-what is already drawn. Drilling in with a double click still exists: the view
-zooms until the block fills the window, then the focus switches and the
-viewport is the fit of the node you jumped to. Going up plays the same
-motion backwards.
+The script installs a `.desktop` entry and links `spacequilt.svg` into the
+icon theme, both pointing at this checkout. Wayland compositors look up a
+window's icon through its desktop id, so without the entry the task bar shows
+a generic icon. The entry registers `inode/directory` as well, which gives
+folders an *Open with SpaceQuilt* action.
 
 ## Status
 
-Early MVP. Works end-to-end; rough edges expected on very large trees (the
-whole `du` output is held in memory as a Python object graph).
+Early. Everything works end to end. SpaceQuilt keeps the whole `du` output in
+memory as Python objects. A home directory of 5.8 million entries takes about
+1.8 GB of RAM, and parsing it adds about 2 seconds after `du` finishes.

@@ -1,48 +1,43 @@
 #!/usr/bin/env python3
-"""SpaceQuilt - disk usage as icicle columns or a SpaceMonger-style nested map.
+"""SpaceQuilt - disk usage as a SpaceMonger-style nested map or icicle columns.
 
-Scans a directory with `du` (exactly the trick the original xdiskusage uses)
-and draws the result as horizontal, size-proportional columns. Click a block
-to drill into it; use the breadcrumb or Backspace to go back out.
+SpaceQuilt runs `du -k --all`, the way xdiskusage does, and draws the tree in
+two views. Boxes: each directory is a titled box with its children packed
+inside. Icicle: one column per depth, blocks sized by bytes. Double click a
+block to drill into it; the breadcrumb or Backspace takes you back up.
 
 Usage:
-    spacequilt [PATH] [-X/--cross-filesystems] [--colors SCHEME]
+    spacequilt [PATH] [-x | -X] [--view VIEW] [--colors SCHEME] [--style STYLE]
 
-  PATH               Directory to scan. Without it a page lists the mounted
-                     volumes and recent scans to pick from (also Ctrl+O).
-  -X, --cross-filesystems  Descend into other mounted filesystems too. By
-                     default du is run with -x, so scanning / measures just
-                     the root filesystem instead of every mount under it.
-                     Scanning a mount point also shows the volume's free
-                     space as a block next to the scanned directory.
-  --colors SCHEME    branches (hue per top-level entry, lighter with depth),
-                     levels (fixed palette cycling by depth), or rainbow
-                     (every level re-spreads the hues, first child keeps the
-                     parent's). Remembered between runs; the toolbar has the
-                     same choice.
-  --view VIEW        icicle (default): size-proportional columns, one per
-                     depth. boxes: SpaceMonger-style nested rectangles, each
-                     directory a titled box with its children packed inside.
-                     Remembered; Ctrl+1 / Ctrl+2 or the toolbar switch live.
-  --style STYLE      Relief: flat, raised (default: light top/left edge, dark
-                     bottom/right edge, soft gradient, sunken content areas
-                     in the boxes view) or deep (the same, twice as strong).
-                     Remembered too; the toolbar's Style menu is the same.
+  PATH               Directory to scan. Without it, a page lists the mounted
+                     volumes and your recent scans (Ctrl+O opens it too).
+  -x                 Stay on one filesystem (du -x), the default. A scan of /
+                     then measures the root volume without the other disks,
+                     /proc or /sys, and shows its free space as a block.
+  -X                 Descend into every filesystem mounted below PATH.
+  --view VIEW        boxes (default) or icicle. Ctrl+1 / Ctrl+2 switch live.
+  --colors SCHEME    levels (one colour per depth), branches (one hue per
+                     top-level entry, lighter with depth) or rainbow (each
+                     level spreads the hues again). Sets the starting view's
+                     scheme; boxes defaults to levels, icicle to branches.
+  --style STYLE      flat, raised (default) or deep: how much relief the
+                     blocks get.
+
+SpaceQuilt remembers the view, the schemes and the style between runs.
 
 Interaction:
-  Wheel             Zoom continuously around the cursor.
-  Shift / Ctrl + wheel   Zoom one axis only (sizes / depth).
-  Drag              Pan the view.
-  Left click        Select the block under the cursor.
-  Double click      Drill into it (double click the focused column to go up).
-  0 / Ctrl+0        Fit the view back to the focused node.
-  Breadcrumb / Backspace   Go up one level.
-  Right click       Context menu (open in file manager, copy path).
-  Ctrl+R            Rescan the current root.
-  Ctrl+O            Pick a new directory to scan.
-  Ctrl+M            Toggle staying on one filesystem.
-  Ctrl+1 / Ctrl+2   Icicle view / boxes view.
-  Esc               Cancel a running scan, otherwise go up one level.
+  Wheel                  Zoom around the cursor.
+  Shift / Ctrl + wheel   Icicle: zoom sizes / depth only.
+  Drag                   Pan.
+  Click                  Select a block.
+  Double click           Drill in (on the focused block: go up).
+  Backspace, Esc         Go up one level. Esc during a scan cancels it.
+  0, Ctrl+0              Fit the focused directory to the window.
+  Right click            Open in file manager, copy path.
+  Ctrl+O                 Volumes, recent scans, browse.
+  Ctrl+R                 Rescan.
+  Ctrl+M                 One filesystem on or off.
+  Ctrl+1 / Ctrl+2        Icicle / boxes view.
 """
 
 import argparse
@@ -138,12 +133,17 @@ HALO_ALPHA = 60             # heavier than this visibly thins the glyphs
 SHADE_JITTER = 0.05
 COLOR_SCHEMES = ("branches", "levels", "rainbow")
 DEFAULT_SCHEME = "branches"
+# Each view remembers its own scheme. In the icicle view the column already
+# shows depth, so colour is best spent on which top-level branch a block
+# belongs to; in the boxes view depth is what nesting obscures, so colour
+# shows the level.
+VIEW_SCHEMES = {"icicle": "branches", "boxes": "levels"}
 STYLES = ("flat", "raised", "deep")
 DEFAULT_STYLE = "raised"
 # Earlier names of settings values, mapped on load.
 LEGACY_VALUES = {"classic": "branches", "spacemonger": "levels", "bevel": "raised"}
 VIEWS = ("icicle", "boxes")
-DEFAULT_VIEW = "icicle"
+DEFAULT_VIEW = "boxes"
 # Boxes view: nested rectangles with a title bar per directory.
 BOX_INSET = 3.0             # px between a box's frame and its children
 BOX_TITLE_PAD = 2.0         # px above/below the title text
@@ -2299,12 +2299,28 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.one_fs = one_fs
         self.settings = QSettings("spacequilt", "spacequilt")
-        if scheme is None:
-            scheme = self._setting("colors", COLOR_SCHEMES, DEFAULT_SCHEME)
         if style is None:
             style = self._setting("style", STYLES, DEFAULT_STYLE)
         if view is None:
             view = self._setting("view", VIEWS, DEFAULT_VIEW)
+        # Per-view schemes. A single "colors" value from before they were
+        # split seeds both views once and is then dropped.
+        legacy = self.settings.value("colors")
+        if isinstance(legacy, str):
+            # Remove first: QSettings.remove("colors") would also drop the
+            # colors/<view> keys written below.
+            self.settings.remove("colors")
+            legacy = LEGACY_VALUES.get(legacy, legacy)
+            if legacy in COLOR_SCHEMES:
+                for name in VIEWS:
+                    self.settings.setValue(f"colors/{name}", legacy)
+        schemes = {
+            name: self._setting(f"colors/{name}", COLOR_SCHEMES, VIEW_SCHEMES[name])
+            for name in VIEWS
+        }
+        if scheme is not None:
+            schemes[view] = scheme
+            self.settings.setValue(f"colors/{view}", scheme)
         self.scanner = None
         self._stopping = []          # scanners still winding down
         self._progress_timer = QTimer(self)
@@ -2324,7 +2340,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         for name in VIEWS:
             widget = self.views[name]
-            widget.set_scheme(scheme)
+            widget.set_scheme(schemes[name])
             widget.set_style(style)
             widget.focus_changed.connect(self._on_focus)
             widget.selection_changed.connect(self._on_selection)
@@ -2367,11 +2383,10 @@ class MainWindow(QMainWindow):
         self.act_one_fs.setShortcut("Ctrl+M")
         self.act_one_fs.setToolTip(
             "<b>One filesystem</b> (Ctrl+M)<br>"
-            "When on, the scan stops at mount points and measures only the "
-            "filesystem the scanned directory lives on, so scanning <tt>/</tt> "
-            "shows the root volume instead of every mounted disk, "
-            "<tt>/proc</tt> or <tt>/sys</tt> as well (du -x).<br>"
-            "Toggling it rescans."
+            "On: the scan stops at mount points (du -x). A scan of <tt>/</tt> "
+            "measures the root volume without the other disks, <tt>/proc</tt> "
+            "or <tt>/sys</tt>.<br>"
+            "Changing it rescans."
         )
         self.act_one_fs.triggered.connect(self._toggle_one_fs)
         act_fit = QAction(self._icon("fit"), "Fit", self)
@@ -2384,8 +2399,8 @@ class MainWindow(QMainWindow):
         view_group.setExclusive(True)
         self.view_actions = {}
         for name, text, tip, key in (
-            ("icicle", "Icicle", "Columns per depth, sized by bytes", "Ctrl+1"),
-            ("boxes", "Boxes", "Nested titled boxes, SpaceMonger style", "Ctrl+2"),
+            ("icicle", "Icicle", "One column per depth, blocks sized by bytes", "Ctrl+1"),
+            ("boxes", "Boxes", "Directories as titled boxes, children inside", "Ctrl+2"),
         ):
             act = QAction(self._icon(name), text, self)
             act.setCheckable(True)
@@ -2406,20 +2421,21 @@ class MainWindow(QMainWindow):
         for name in VIEWS:
             tb.addAction(self.view_actions[name])
         tb.addSeparator()
-        tb.addWidget(self._menu_button(
-            "Colors", "colors", "Colour scheme of the blocks",
+        self.colors_button = self._menu_button(
+            "Colors", "colors", "Colour scheme of the blocks in this view",
             (("branches", "Branches", "One hue per top-level entry, lighter with depth"),
              ("levels", "Levels", "One colour per depth, cycling"),
-             ("rainbow", "Rainbow", "Every level re-spreads the hues; the first "
+             ("rainbow", "Rainbow", "Each level spreads the hues again; the largest "
                                     "child keeps its parent's")),
-            scheme, self._set_scheme,
-        ))
+            schemes[view], self._set_scheme,
+        )
+        tb.addWidget(self.colors_button)
         tb.addWidget(self._menu_button(
             "Style", "cube", "Relief of the blocks",
             (("flat", "Flat", "Plain fills and thin outlines"),
-             ("raised", "Raised", "Light top/left edge, dark bottom/right edge, "
-                                  "soft gradient, sunken content areas"),
-             ("deep", "Deep", "The same relief, twice as strong")),
+             ("raised", "Raised", "Light top and left edge, dark bottom and right "
+                                  "edge, soft gradient, sunken content areas"),
+             ("deep", "Deep", "Raised, twice as strong")),
             style, self._set_style,
         ))
 
@@ -2479,6 +2495,8 @@ class MainWindow(QMainWindow):
             new.setFocus()
         self.view_actions[name].setChecked(True)
         self.settings.setValue("view", name)
+        for act in self.colors_button.menu().actions():
+            act.setChecked(act.data() == new.scheme)
         self._on_focus(new.focus)
 
     def _menu_button(self, title, icon, tip, options, current, handler):
@@ -2505,9 +2523,10 @@ class MainWindow(QMainWindow):
         return btn
 
     def _set_scheme(self, scheme):
-        for widget in self.views.values():
-            widget.set_scheme(scheme)
-        self.settings.setValue("colors", scheme)
+        """Only the visible view changes; the other keeps its own scheme."""
+        self.view.set_scheme(scheme)
+        name = next(n for n, w in self.views.items() if w is self.view)
+        self.settings.setValue(f"colors/{name}", scheme)
 
     def _on_focus(self, node):
         sender = self.sender()
@@ -2593,7 +2612,7 @@ class MainWindow(QMainWindow):
         self._end_progress()
         for widget in self.views.values():
             widget.empty_text = (
-                "Scan cancelled.  Ctrl+R rescans, Ctrl+O opens another directory."
+                "Scan cancelled. Ctrl+R scans again, Ctrl+O picks another directory."
             )
             widget.update()
         self.statusBar().showMessage(f"Scan of {self._current_path} cancelled.")
@@ -2650,14 +2669,13 @@ class MainWindow(QMainWindow):
         box.setWindowTitle("One filesystem")
         box.setText("Stay on one filesystem" if checked else "Cross filesystems")
         box.setInformativeText(
-            ("The scan will stop at mount points and measure only the "
-             "filesystem that the scanned directory lives on (du -x). "
-             "Scanning / then shows the root volume alone, without other "
-             "mounted disks, /proc or /sys."
+            ("The scan will stop at mount points (du -x) and measure the "
+             "filesystem of the scanned directory alone. A scan of / then "
+             "leaves out the other disks, /proc and /sys."
              if checked else
-             "The scan will descend into every filesystem mounted under the "
-             "scanned directory, so the sizes add up across disks.")
-            + "\n\nChanging this rescans the current directory now."
+             "The scan will descend into every filesystem mounted below the "
+             "scanned directory and add their sizes together.")
+            + "\n\nSpaceQuilt rescans the current directory when you confirm."
         )
         rescan = box.addButton("Rescan", QMessageBox.AcceptRole)
         box.addButton(QMessageBox.Cancel)
@@ -2707,7 +2725,7 @@ def main():
     )
     parser.add_argument(
         "path", nargs="?", default=None,
-        help="Directory to scan. Without it the volumes page opens.",
+        help="Directory to scan. Without it, the volumes page opens.",
     )
     parser.add_argument(
         "-x",
@@ -2715,35 +2733,35 @@ def main():
         dest="one_filesystem",
         action="store_true",
         default=True,
-        help="Do not cross filesystem boundaries (du -x). This is the default.",
+        help="Stay on one filesystem (du -x). The default.",
     )
     parser.add_argument(
         "-X",
         "--cross-filesystems",
         dest="one_filesystem",
         action="store_false",
-        help="Descend into other mounted filesystems as well.",
+        help="Descend into every filesystem mounted below PATH.",
     )
     parser.add_argument(
         "--colors",
         choices=COLOR_SCHEMES,
         default=None,
-        help="Colour scheme for this run (also remembered as the new default). "
-             "Without it the last choice from the toolbar is used.",
+        help="Colour scheme of the starting view. SpaceQuilt remembers it for "
+             "that view.",
     )
     parser.add_argument(
         "--view",
         choices=VIEWS,
         default=None,
-        help="Start in this view: icicle columns or SpaceMonger-style nested "
-             "boxes (also remembered as the new default).",
+        help="View to start in: boxes (nested boxes, the default) or icicle "
+             "(columns). SpaceQuilt remembers it.",
     )
     parser.add_argument(
         "--style",
         choices=STYLES,
         default=None,
-        help="Relief of the blocks for this run: flat, raised or deep (also "
-             "remembered as the new default).",
+        help="Relief of the blocks: flat, raised (the default) or deep. "
+             "SpaceQuilt remembers it.",
     )
     args = parser.parse_args()
 
@@ -2755,8 +2773,6 @@ def main():
     if os.path.exists(ICON_PATH):
         app.setWindowIcon(QIcon(ICON_PATH))
     win = MainWindow(args.path, args.one_filesystem, args.colors, args.style, args.view)
-    if args.colors:
-        win.settings.setValue("colors", args.colors)
     if args.style:
         win.settings.setValue("style", args.style)
     if args.view:
