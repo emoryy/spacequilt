@@ -154,3 +154,7 @@ folders an *Open with SpaceQuilt* action.
 Early. Everything works end to end. SpaceQuilt keeps the whole `du` output in
 memory as Python objects. A home directory of 5.8 million entries takes about
 1.8 GB of RAM, and parsing it adds about 2 seconds after `du` finishes.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
