@@ -6,45 +6,91 @@ and draws the result as horizontal, size-proportional columns. Click a block
 to drill into it; use the breadcrumb or Backspace to go back out.
 
 Usage:
-    spacequilt [PATH] [-x/--one-filesystem]
+    spacequilt [PATH] [-X/--cross-filesystems] [--colors SCHEME]
 
   PATH               Directory to scan. Default: current directory.
-  -x, --one-filesystem   Do not cross filesystem boundaries (passes -x to du).
+  -X, --cross-filesystems  Descend into other mounted filesystems too. By
+                     default du is run with -x, so scanning / measures just
+                     the root filesystem instead of every mount under it.
+                     Scanning a mount point also shows the volume's free
+                     space as a block next to the scanned directory.
+  --colors SCHEME    classic (hue per top-level child, lighter with depth),
+                     spacemonger (fixed palette cycling by depth), or rainbow
+                     (every level re-spreads the hues, first child keeps the
+                     parent's). Remembered between runs; the toolbar has the
+                     same choice.
+  --style STYLE      bevel (default) or flat. bevel: blocks get a light top/left
+                     edge, a dark bottom/right edge and a soft gradient, a
+                     nod to SpaceMonger's raised tiles. Remembered too; the
+                     toolbar's 3D toggle is the same switch.
 
 Interaction:
-  Left click        Drill into the block under the cursor.
+  Wheel             Zoom continuously around the cursor.
+  Shift / Ctrl + wheel   Zoom one axis only (sizes / depth).
+  Drag              Pan the view.
+  Left click        Select the block under the cursor.
+  Double click      Drill into it (double click the focused column to go up).
+  0 / Ctrl+0        Fit the view back to the focused node.
   Breadcrumb / Backspace   Go up one level.
   Right click       Context menu (open in file manager, copy path).
   Ctrl+R            Rescan the current root.
   Ctrl+O            Pick a new directory to scan.
-  Esc               Go up one level (quits at the root).
+  Ctrl+M            Toggle staying on one filesystem.
+  Esc               Cancel a running scan, otherwise go up one level.
 """
 
 import argparse
+import gc
+import math
+import operator
 import os
+import re
+import signal
 import subprocess
 import sys
+import tempfile
+import time
+import zlib
 
 os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
 
-from PySide6.QtCore import Qt, QRectF, QThread, Signal
+from PySide6.QtCore import (
+    QEasingCurve,
+    QPointF,
+    QRectF,
+    QSettings,
+    QThread,
+    QTimer,
+    QVariantAnimation,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
+    QActionGroup,
+    QBrush,
     QColor,
+    QLinearGradient,
+    QPainterPath,
     QGuiApplication,
     QFont,
     QFontMetrics,
+    QIcon,
     QPainter,
     QPen,
+    QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPushButton,
+    QToolButton,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -52,22 +98,93 @@ from PySide6.QtWidgets import (
 MIN_BLOCK_PX = 2.0
 # Column width is clamped to this range; within it we aim for ~7 visible levels.
 COL_MIN, COL_MAX = 130, 230
+# Logical layout space: the focus node is LOGICAL_H tall and one column is
+# LOGICAL_COLW wide. The viewport (zx/zy/pan) maps that onto the widget.
+LOGICAL_H = 1000.0
+LOGICAL_COLW = 170.0
+ZOOM_STEP = 1.0018          # per wheel unit; one notch (120) is about 1.24x
+# The horizontal axis carries depth, not detail, so widening columns as fast as
+# the vertical zoom would push every deeper level off screen after a few
+# notches. Damp it: 1.0 gives a strictly uniform zoom, 0 pins the width.
+# Column width is derived from the vertical zoom (times a user offset set by
+# the one-axis wheel modes) rather than tracked separately, so the two axes
+# cannot drift apart when one of them hits its clamp before the other.
+H_ZOOM_DAMPING = 0.4
+KEY_ZOOM_STEP = 1.25
+FIT_ANIM_MS = 320
+NAV_ANIM_MS = 360           # drill in / out
+FADE_MS = 220               # crossfade over the colour change at a focus switch
+ZOOM_OUT_LIMIT = 0.25       # both limits are relative to the fit zoom
+ZOOM_IN_CAP = 1e7
+ZOOM_IN_UNIT = 4096.0       # stop zooming near "one screen = one disk block"
+COLW_MIN_PX, COLW_MAX_PX = 14.0, 900.0
+DRAG_THRESHOLD = 4.0        # px of movement before a click becomes a pan
+HALO_ALPHA = 60             # heavier than this visibly thins the glyphs
+# Per-node lightness jitter (+-), hashed from the path so it is stable across
+# rescans. Adjacent same-hue siblings stay distinguishable while scrolling.
+SHADE_JITTER = 0.05
+COLOR_SCHEMES = ("classic", "spacemonger", "rainbow")
+DEFAULT_SCHEME = "classic"
+STYLES = ("flat", "bevel")
+DEFAULT_STYLE = "bevel"
+# SpaceMonger's look: one flat pastel per depth counted from the scanned root,
+# cycling. Approximated from screenshots, in depth order.
+SPACEMONGER_PALETTE = (
+    "#ff8080",   # salmon
+    "#ffff50",   # yellow
+    "#80ff80",   # green
+    "#80ffff",   # cyan
+    "#9090ff",   # lavender
+    "#ff80ff",   # magenta
+    "#c0c0c0",   # grey
+)
+# Next to the script, resolved through the symlink people install in ~/bin.
+ICON_PATH = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "spacequilt.svg"
+)
 
 
 class Node:
-    __slots__ = ("path", "size", "children", "parent", "is_group")
+    __slots__ = ("path", "size", "children", "parent", "kind", "_kids")
 
-    def __init__(self, path, size, is_group=False):
+    # Leaves share one immutable empty tuple instead of each owning a list:
+    # files are the bulk of a scan and the list per node was a third of the
+    # tree's memory and a good part of its build time.
+    def __init__(self, path, size, kind=None):
         self.path = path
         self.size = size          # bytes, as reported by du (cumulative)
-        self.children = []
+        self.children = ()
         self.parent = None
-        self.is_group = is_group  # synthetic "N smaller items" aggregate
+        # None for a real entry; "group" = synthetic "N smaller items"
+        # aggregate, "disk" = wrapper over a mount point, "free" = its free
+        # space. Synthetic nodes keep their label in .path.
+        self.kind = kind
+        self._kids = None
+
+    @property
+    def is_group(self):
+        return self.kind == "group"
+
+    @property
+    def synthetic(self):
+        return self.kind is not None
+
+    @property
+    def children_size(self):
+        """Total size of the direct children, computed once.
+
+        The layout needs the size of the undrawn tail every frame; summing it
+        directly is O(children) per directory per frame, which for a cache
+        directory with tens of thousands of files is what makes panning lag.
+        """
+        if self._kids is None:
+            self._kids = sum(c.size for c in self.children)
+        return self._kids
 
     @property
     def name(self):
-        if self.is_group:
-            return self.path      # groups store their label in .path
+        if self.kind is not None:
+            return self.path
         base = os.path.basename(self.path.rstrip("/"))
         return base or self.path   # root ("/") keeps its full path
 
@@ -82,88 +199,306 @@ def human(size):
         s /= 1024
 
 
+class TreeBuilder:
+    """Accumulates `du -k --all` lines into a Node tree.
+
+    Feed lines as they arrive so parsing overlaps with du still walking the
+    disk, then call finish(). The cyclic GC is paused while building: with
+    millions of small objects being allocated it otherwise re-scans the
+    growing heap over and over and dominates the run time.
+    """
+
+    def __init__(self):
+        self.nodes = {}
+        self.last_path = None
+        self.entries = None          # set once finished; the dict is dropped
+        self._gc_was_enabled = gc.isenabled()
+        gc.disable()
+
+    def count(self):
+        return self.entries if self.entries is not None else len(self.nodes)
+
+    def add(self, line):
+        size, tab, path = line.partition("\t")
+        if not tab:
+            return
+        try:
+            size_kib = int(size)
+        except ValueError:
+            return
+        if path.endswith("\n"):
+            path = path[:-1]
+        self.nodes[path] = Node(path, size_kib * 1024)
+        self.last_path = path
+
+    def finish(self):
+        """Link parents, sort children; return the root Node or None."""
+        try:
+            return self._finish()
+        finally:
+            if self._gc_was_enabled:
+                gc.enable()
+
+    def discard(self):
+        """Drop a partial tree (cancelled scan) and resume the GC."""
+        self.nodes = {}
+        if self._gc_was_enabled:
+            gc.enable()
+
+    def _finish(self):
+        nodes = self.nodes
+        if not nodes:
+            return None
+        get = nodes.get
+        for path, node in nodes.items():
+            parent_path = path.rpartition("/")[0]
+            if not parent_path and path.startswith("/"):
+                parent_path = "/"
+            parent = get(parent_path)
+            if parent is not None and parent is not node:
+                kids = parent.children
+                if not kids:
+                    parent.children = kids = []
+                kids.append(node)
+                node.parent = parent
+
+        # Root = the deepest-listed node with no in-set parent (du prints it last).
+        root = nodes.get(self.last_path)
+        while root is not None and root.parent is not None:
+            root = root.parent
+        if root is None:
+            root = max(nodes.values(), key=operator.attrgetter("size"))
+
+        by_size = operator.attrgetter("size")
+        for node in nodes.values():
+            if node.children:
+                node.children.sort(key=by_size, reverse=True)
+        # The tree holds every node from here on; keeping the path index too
+        # would double the memory for nothing.
+        self.entries = len(nodes)
+        self.nodes = {}
+        return root
+
+
 def build_tree(du_output):
     """Turn `du -k --all` output into a Node tree; return the root Node."""
-    nodes = {}
-    last_path = None
+    builder = TreeBuilder()
     for line in du_output.splitlines():
-        tab = line.find("\t")
-        if tab < 0:
-            continue
-        try:
-            size_kib = int(line[:tab])
-        except ValueError:
-            continue
-        path = line[tab + 1:]
-        nodes[path] = Node(path, size_kib * 1024)
-        last_path = path
+        builder.add(line)
+    return builder.finish()
 
-    if not nodes:
-        return None
 
-    for path, node in nodes.items():
-        parent_path = os.path.dirname(path.rstrip("/"))
-        parent = nodes.get(parent_path)
-        if parent is not None and parent is not node:
-            parent.children.append(node)
-            node.parent = parent
+_OCTAL_ESCAPE = re.compile(rb"\\([0-7]{3})")
 
-    # Root = the deepest-listed node with no in-set parent (du prints it last).
-    root = nodes.get(last_path)
-    while root is not None and root.parent is not None:
-        root = root.parent
-    if root is None:
-        root = max(nodes.values(), key=lambda n: n.size)
 
-    for node in nodes.values():
-        node.children.sort(key=lambda n: n.size, reverse=True)
-    return root
+def _unescape_mount(field):
+    """/proc/mounts escapes space, tab, newline and backslash as \\ooo; undo
+    that on the raw bytes, then decode like the kernel handed us the name."""
+    raw = _OCTAL_ESCAPE.sub(lambda m: bytes([int(m.group(1), 8)]), field)
+    return raw.decode("utf-8", "surrogateescape")
+
+
+def _mount_device(mount_point):
+    """Device (or fs source) mounted at `mount_point`, from /proc/mounts."""
+    device = None
+    try:
+        with open("/proc/mounts", "rb") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                if _unescape_mount(parts[1]) == mount_point:
+                    device = _unescape_mount(parts[0])   # later lines win
+    except (OSError, ValueError):
+        pass
+    return device or mount_point
+
+
+class DiskNode(Node):
+    """The wrapper over a mount point; carries the volume's statvfs numbers so
+    the GUI never has to touch the filesystem for them."""
+    __slots__ = ("total", "free")
+
+    def __init__(self, label, size, total, free):
+        super().__init__(label, size, kind="disk")
+        self.total = total
+        self.free = free
+
+
+def wrap_mount(root, path):
+    """Put a "disk" node over `root` with a sibling "free" block, like
+    SpaceMonger's free-space tile, so the tree shows what the volume has left."""
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return root
+    free = st.f_bavail * st.f_frsize
+    total = st.f_blocks * st.f_frsize
+    disk = DiskNode(_mount_device(path), root.size + free, total, free)
+    disk.children = [root, Node("Free space", free, kind="free")]
+    disk.children.sort(key=operator.attrgetter("size"), reverse=True)
+    for child in disk.children:
+        child.parent = disk
+    return disk
+
+
+def volume_status(node):
+    """Status-bar text for a "disk" node: usage of the volume it wraps."""
+    real = next((c for c in node.children if c.kind is None), None)
+    if real is None or not isinstance(node, DiskNode):
+        return f"{node.name}    {human(node.size)}"
+    total, free = node.total, node.free
+    pct = 100.0 * free / total if total else 0.0
+    return (
+        f"{node.name} on {real.path}    {human(total)} total, "
+        f"{human(total - free)} used, {human(free)} free ({pct:.1f}%)"
+    )
 
 
 class Scanner(QThread):
     done = Signal(object)          # emits root Node
     failed = Signal(str)
 
-    def __init__(self, path, one_fs):
+    def __init__(self, path, one_fs, expected_entries=None):
         super().__init__()
         self.path = path
         self.one_fs = one_fs
+        self._proc = None
+        self._aborted = False
+        self.started_at = time.monotonic()
+        # Progress is read by the GUI thread straight off the builder, so
+        # the scan loop itself pays nothing for it. The target is the used
+        # inode count of the volume for a mount-point scan (every du line is
+        # one inode, give or take hardlinks), else the previous scan's entry
+        # count for this path; None means indeterminate.
+        self.builder = None
+        self.target = expected_entries or None
+        self.is_mount = False        # decided in run(): it touches the fs
+
+    def progress(self):
+        """(entries so far, target or None, directory being walked, seconds)."""
+        b = self.builder
+        entries = b.count() if b is not None else 0
+        last = b.last_path if b is not None else None
+        current = last.rpartition("/")[0] or last if last else self.path
+        return entries, self.target, current, time.monotonic() - self.started_at
 
     def run(self):
+        self.is_mount = self.one_fs and os.path.ismount(self.path)
+        if self.is_mount:
+            try:
+                st = os.statvfs(self.path)
+                if st.f_files > 0:
+                    self.target = st.f_files - st.f_ffree
+            except OSError:
+                pass
         cmd = ["du", "-k", "--all"]
         if self.one_fs:
             cmd.append("-x")
         cmd.append(self.path)
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, errors="replace"
-            )
-        except OSError as exc:
-            self.failed.emit(str(exc))
+        # stderr goes to a file: du can emit thousands of permission errors,
+        # and a pipe we are not draining while reading stdout would block it.
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8",
+                                    errors="replace") as err_file:
+            try:
+                # Popen rather than run(), so abort() can reach the child: a du
+                # over / outlives the window otherwise.
+                self._proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=err_file,
+                    text=True, errors="replace",
+                )
+            except OSError as exc:
+                self.failed.emit(str(exc))
+                return
+            if self._aborted:
+                # abort() came before the child existed and had nothing to
+                # kill; do it for it instead of walking the whole disk.
+                self.abort()
+                self._proc.wait()
+                return
+            # Parse as the lines arrive, so building the tree overlaps with du
+            # walking the disk instead of starting after it.
+            builder = self.builder = TreeBuilder()
+            add = builder.add
+            with self._proc.stdout:
+                for line in self._proc.stdout:
+                    add(line)
+            self._proc.wait()
+            if self._aborted:
+                builder.discard()
+                return
+            root = builder.finish()
+            if root is None:
+                err_file.seek(0)
+                msg = err_file.read().strip() or "du returned no usable output."
+                self.failed.emit(msg)
+                return
+        # One deliberate full collection here, off the GUI thread's schedule:
+        # the millions of nodes just allocated would otherwise trigger it at
+        # some random later moment as a visible pause.
+        gc.collect()
+        if self.is_mount:
+            root = wrap_mount(root, self.path)
+        if self._aborted:            # cancelled during the seconds above
             return
-        root = build_tree(proc.stdout)
-        if root is None:
-            msg = proc.stderr.strip() or "du returned no usable output."
-            self.failed.emit(msg)
-        else:
-            self.done.emit(root)
+        self.done.emit(root)
+
+    def abort(self):
+        """Stop caring about this scan and kill the du behind it."""
+        self._aborted = True
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
 
 
 class IcicleWidget(QWidget):
-    focus_changed = Signal(object)   # emits the new focus Node
+    focus_changed = Signal(object)       # emits the new focus Node
+    selection_changed = Signal(object)   # emits the selected Node, or None
+    cancel_requested = Signal()          # Esc while a scan is running
 
     def __init__(self):
         super().__init__()
         self.setMouseTracking(True)
         self.root = None
         self.focus = None
+        self.scheme = DEFAULT_SCHEME
+        self.bevel = False
+        self.progress = None         # (path, entries, target, current, secs) while scanning
+        self.empty_text = "No data."
         self.hovered = None
+        self.selected = None
         self._blocks = []            # (QRectF, node, base_hue, depth)
+        self._groups = {}            # (id(parent), first index) -> group Node
+        self._prev_groups = {}       # same, from the previous frame
+        # Viewport. Layout happens in a logical space where the focus node is
+        # LOGICAL_H tall and one column is LOGICAL_COLW wide; zx/zy/pan map it
+        # to pixels. Blocks are laid out in screen pixels directly, so zooming
+        # in subdivides deeper levels instead of just magnifying the same ones.
+        self.zy = 0.0                # 0 until the first fit
+        self.hx = 1.0                # horizontal offset on top of the damped zy
+        self._anim = None            # running viewport animation, if any
+        self._fade = None            # (snapshot pixmap, opacity) during a crossfade
+        self._fade_anim = None
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._max_depth = 1          # deepest column last frame, for pan limits
+        self._more_right = False     # tree continues past the right edge
+        self._last_h = 0             # widget height at the last layout
+        self._press_pos = None
+        self._drag_origin = None
+        self._dragging = False
         self.setMinimumSize(480, 320)
         self.setFocusPolicy(Qt.StrongFocus)
 
     def set_root(self, root):
         self.root = root
+        self._stop_anim()
+        self._stop_fade()
+        self._groups = {}
+        self._prev_groups = {}
         self.set_focus(root)
 
     def set_focus(self, node):
@@ -171,80 +506,503 @@ class IcicleWidget(QWidget):
             return
         self.focus = node
         self.hovered = None
+        self.set_selected(None)
+        self.fit_view(redraw=False)
         self.focus_changed.emit(node)
+        self.update()
+
+    def set_progress(self, progress):
+        """Show (or with None, hide) the scanning overlay."""
+        self.progress = progress
+        self.update()
+
+    def set_scheme(self, scheme):
+        if scheme not in COLOR_SCHEMES:
+            raise ValueError(scheme)
+        self.scheme = scheme
+        self.update()
+
+    def set_bevel(self, on):
+        self.bevel = bool(on)
+        self.update()
+
+    def _group_color(self, hue, depth, group):
+        """Groups keep the tint of the blocks they stand in for, muted and
+        dark, so they read as "part of this branch" instead of dead grey."""
+        base = self._block_color(hue, depth, group, jitter=False)
+        h = max(0.0, base.hslHueF())        # -1 for achromatic colours
+        return QColor.fromHslF(h, base.hslSaturationF() * 0.45, 0.30)
+
+    def set_selected(self, node):
+        if node is self.selected:
+            return
+        self.selected = node
+        self.selection_changed.emit(node)
         self.update()
 
     def go_up(self):
         if self.focus is not None and self.focus.parent is not None:
-            self.set_focus(self.focus.parent)
+            self.navigate(self.focus.parent)
             return True
         return False
 
-    # --- layout -----------------------------------------------------------
-    def _col_width(self):
-        target = self.width() / 7.0
-        return max(COL_MIN, min(COL_MAX, target))
+    # --- viewport ---------------------------------------------------------
+    def _fit_zy(self):
+        return max(1e-9, self.height() / LOGICAL_H)
 
+    def _fit_zx(self):
+        return max(COL_MIN, min(COL_MAX, self.width() / 7.0)) / LOGICAL_COLW
+
+    def _raw_zx(self):
+        return (
+            self._fit_zx() * (self.zy / self._fit_zy()) ** H_ZOOM_DAMPING * self.hx
+        )
+
+    @property
+    def zx(self):
+        return max(
+            COLW_MIN_PX / LOGICAL_COLW, min(COLW_MAX_PX / LOGICAL_COLW, self._raw_zx())
+        )
+
+    def fit_view(self, redraw=True, animate=False):
+        """Reset the viewport so the focus node fills the widget."""
+        self._stop_anim()
+        if animate and self.zy > 0 and self.focus is not None:
+            self._animate_to_fit()
+            return
+        self.zy = self._fit_zy()
+        self.hx = 1.0
+        self.pan_x = 0.0
+        self.pan_y = 0.0
+        self._last_h = self.height()
+        if redraw:
+            self.update()
+
+    def _stop_anim(self):
+        anim = self._anim
+        if anim is not None:
+            self._anim = None
+            anim.stop()
+
+    def _animate_to_fit(self, on_done=None):
+        self._animate_view(self._fit_zy(), 1.0, 0.0, 0.0, on_done)
+
+    def _animate_view(self, zy1, hx1, pan_x1, pan_y1, on_done=None):
+        """Ease from the current viewport to the given one.
+
+        Zoom is interpolated geometrically and the view is anchored on the
+        logical point under the widget centre, so the motion reads as one
+        smooth zoom-and-glide rather than the two axes racing each other.
+        """
+        w, h = self.width() / 2.0, self.height() / 2.0
+        zx0, zy0 = self.zx, self.zy
+        start = (
+            math.log(zy0), math.log(max(1e-9, self.hx)),
+            (w - self.pan_x) / zx0, (h - self.pan_y) / zy0,
+        )
+        # zx at the end state, with hx1 applied.
+        hx_now, self.hx, self.zy = self.hx, hx1, zy1
+        zx1 = self.zx
+        self.hx, self.zy = hx_now, zy0
+        end = (
+            math.log(zy1), math.log(max(1e-9, hx1)),
+            (w - pan_x1) / zx1, (h - pan_y1) / zy1,
+        )
+
+        def step(t):
+            if self._anim is not anim:
+                return
+            u = float(t)
+            lzy, lhx, cx, cy = (a + (b - a) * u for a, b in zip(start, end))
+            self.zy = math.exp(lzy)
+            self.hx = math.exp(lhx)
+            self.pan_x = w - cx * self.zx
+            self.pan_y = h - cy * self.zy
+            self._last_h = self.height()
+            if u >= 1.0:
+                self.zy, self.hx = zy1, hx1
+                self.pan_x, self.pan_y = pan_x1, pan_y1
+                if on_done is not None:
+                    # Runs while this animation still counts as active, so the
+                    # snapshot it takes is this exact frame, not a re-clamped one.
+                    on_done()
+                if self._anim is anim:
+                    self._anim = None
+            self.update()
+
+        anim = QVariantAnimation(self)
+        anim.setDuration(NAV_ANIM_MS if on_done is not None else FIT_ANIM_MS)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.InOutCubic if on_done else QEasingCurve.OutCubic)
+        anim.valueChanged.connect(step)
+        self._anim = anim
+        anim.start(QVariantAnimation.DeleteWhenStopped)
+
+    # --- animated navigation ----------------------------------------------
+    def navigate(self, node):
+        """Change focus with a zoom animation instead of a jump.
+
+        Drilling in zooms the current view until the target block fills the
+        widget, then switches focus; going up switches first and starts from
+        the viewport in which the old focus fills the widget, then eases to
+        the fit. The switch itself changes colours (the focus column is
+        muted, classic re-fans hues), which a short crossfade covers.
+        """
+        if node is None or node is self.focus or self.focus is None:
+            return
+        if self.zy <= 0 or not self.isVisible():
+            self.set_focus(node)
+            return
+        self._stop_anim()
+        block = next((b for b in self._blocks if b[1] is node), None)
+        if block is not None:
+            rect, _n, _hue, depth = block
+            ly = (rect.top() - self.pan_y) / self.zy
+            lh = rect.height() / self.zy
+            zy1 = self._fit_zy() * LOGICAL_H / lh
+            hx1 = (zy1 / self._fit_zy()) ** -H_ZOOM_DAMPING
+            colw_fit = self._fit_zx() * LOGICAL_COLW
+            self._animate_view(
+                zy1, hx1, -depth * colw_fit, -ly * zy1,
+                on_done=lambda: self._switch_focus(node),
+            )
+            return
+        place = self._place_within(self.focus, node)   # old focus inside the new
+        if place is None:
+            self._switch_focus(node)
+            return
+        # Reproduce the current viewport exactly inside the new focus's
+        # coordinate space, so nothing moves at the switch, then ease out.
+        ly, lh, depth = place
+        zy_o, zx_o = self.zy, self.zx
+        pan_x_o, pan_y_o = self.pan_x, self.pan_y
+        self._switch_focus(node)
+        self.zy = zy_o * LOGICAL_H / lh
+        self.hx = zx_o / (self._fit_zx() * (self.zy / self._fit_zy()) ** H_ZOOM_DAMPING)
+        self.pan_y = pan_y_o - ly * self.zy
+        self.pan_x = pan_x_o - depth * zx_o * LOGICAL_COLW
+        self._animate_to_fit()
+
+    def _switch_focus(self, node):
+        """set_focus with a crossfade from what was on screen."""
+        self._stop_fade()
+        snapshot = self.grab()
+        self.set_focus(node)
+        self._start_fade(snapshot)
+
+    @staticmethod
+    def _place_within(node, ancestor):
+        """Logical (top, height, depth) of `node` laid out under `ancestor`,
+        or None if it is not a descendant."""
+        chain = []
+        n = node
+        while n is not None and n is not ancestor:
+            chain.append(n)
+            n = n.parent
+        if n is None:
+            return None
+        top, height = 0.0, LOGICAL_H
+        for child in reversed(chain):
+            parent = child.parent
+            total = parent.size or 1
+            first = child.children[0] if child.kind == "group" and child.children else child
+            before = 0
+            for sib in parent.children:
+                if sib is first:
+                    break
+                before += sib.size
+            top += height * before / total
+            height *= child.size / total
+        return top, height, len(chain)
+
+    def _revalidate_groups(self):
+        """Selection and hover may point at a group that this frame did not
+        recreate (the tail starts at another index after a zoom). Move them
+        to the group now standing under the same parent, or drop them."""
+        for attr, signal in (("selected", self.selection_changed),
+                             ("hovered", None)):
+            node = getattr(self, attr)
+            if node is None or node.kind != "group":
+                continue
+            if any(b[1] is node for b in self._blocks):
+                continue
+            repl = next(
+                (b[1] for b in self._blocks
+                 if b[1].kind == "group" and b[1].parent is node.parent), None
+            )
+            setattr(self, attr, repl)
+            if signal is not None:
+                signal.emit(repl)
+
+    def _start_fade(self, snapshot):
+        self._fade = (snapshot, 1.0)
+
+        def step(t):
+            if self._fade is None or self._fade_anim is not fade:
+                return
+            self._fade = (snapshot, 1.0 - float(t))
+            if float(t) >= 1.0:
+                self._fade = None
+                self._fade_anim = None
+            self.update()
+
+        fade = QVariantAnimation(self)
+        fade.setDuration(FADE_MS)
+        fade.setStartValue(0.0)
+        fade.setEndValue(1.0)
+        fade.valueChanged.connect(step)
+        self._fade_anim = fade
+        fade.start(QVariantAnimation.DeleteWhenStopped)
+
+    def _stop_fade(self):
+        fade = self._fade_anim
+        self._fade_anim = None
+        self._fade = None
+        if fade is not None:
+            fade.stop()
+
+    def _zoom_in_limit(self):
+        """How far past the fit zoom it is still useful to go, as a factor."""
+        if self.focus is None or self.focus.size <= 0:
+            return ZOOM_IN_CAP
+        return max(4.0, min(ZOOM_IN_CAP, self.focus.size / ZOOM_IN_UNIT))
+
+    def _clamp_zoom(self):
+        fz = self._fit_zy()
+        self.zy = max(fz * ZOOM_OUT_LIMIT, min(fz * self._zoom_in_limit(), self.zy))
+
+    def _clamp_pan(self):
+        """Keep half the content in view, or half a screen of it if it is taller.
+
+        The bound has to be continuous in the zoom level: an "if it fits, show
+        all of it" rule collapses the allowed range the moment the content
+        shrinks below the widget, and the view snaps on that wheel notch.
+        """
+        w, h = float(self.width()), float(self.height())
+        total_h = LOGICAL_H * self.zy
+        keep = min(h, total_h) / 2
+        self.pan_y = min(h - keep, max(keep - total_h, self.pan_y))
+        total_w = max(1, self._max_depth) * LOGICAL_COLW * self.zx
+        if self._more_right:
+            total_w += w
+        keep = min(w, total_w) / 2
+        self.pan_x = min(w - keep, max(keep - total_w, self.pan_x))
+
+    def _zoom_at(self, pos, fy, fh=1.0):
+        """Scale about `pos`, keeping whatever is under the cursor in place.
+
+        `fy` scales the vertical zoom (and, damped, the column width with it);
+        `fh` scales the extra horizontal offset on top of that.
+        """
+        if self.zy <= 0:
+            self.fit_view(redraw=False)
+        old_zx, old_zy = self.zx, self.zy
+        self.zy *= fy
+        self.hx *= fh
+        self._clamp_zoom()
+        if fh != 1.0:
+            # A one-axis change past the width limits would otherwise leave a
+            # dead zone to wind back through. Plain zoom must not do this: its
+            # raw width has to keep tracking zy so zooming back out restores
+            # the fit width even after both axes sat on their limits.
+            self.hx *= self.zx / self._raw_zx()
+        self.pan_x = pos.x() - (pos.x() - self.pan_x) * (self.zx / old_zx)
+        self.pan_y = pos.y() - (pos.y() - self.pan_y) * (self.zy / old_zy)
+        self._clamp_pan()
+        self.update()
+
+    def wheelEvent(self, event):
+        self._stop_anim()
+        dy = event.angleDelta().y()
+        if dy == 0:
+            dy = event.pixelDelta().y() * 3
+        if dy == 0:
+            return
+        factor = ZOOM_STEP ** dy
+        mods = event.modifiers()
+        # Shift: vertical only (sizes), Ctrl: horizontal only (depth).
+        if mods & Qt.ControlModifier:
+            fy, fh = 1.0, factor
+        elif mods & Qt.ShiftModifier:
+            fy, fh = factor, factor ** -H_ZOOM_DAMPING   # cancel the coupling
+        else:
+            fy, fh = factor, 1.0
+        self._zoom_at(event.position(), fy, fh)
+        event.accept()
+
+    # --- layout -----------------------------------------------------------
     def _layout(self, node, x, y, h, depth, base_hue, colw, in_group):
-        rect = QRectF(x, y, colw, h)
-        self._blocks.append((rect, node, base_hue, depth))
+        w, hgt = float(self.width()), float(self.height())
+        if y >= hgt or y + h <= 0 or x >= w:
+            return          # off-screen; nothing below this node can be visible
+        if x + colw > 0:    # columns past the left edge still have visible children
+            self._blocks.append((QRectF(x, y, colw, h), node, base_hue, depth))
+            if depth + 1 > self._max_depth:
+                self._max_depth = depth + 1
         # Inside an already-aggregated group, pack children down to a 1px floor
         # instead of re-aggregating, so a group never nests into itself.
         floor = 1.0 if in_group else MIN_BLOCK_PX
-        if h < floor or not node.children or x + colw > self.width():
+        if h < floor or not node.children or x + colw >= w:
+            if node.children and x + colw >= w:
+                # Cut off by the right edge, so panning must be allowed to
+                # bring it in: the visible depth alone would pin pan_x here.
+                self._more_right = True
             return
         cy = y
         total = node.size or 1
         children = node.children
         n = len(children)
         i = 0
+        drawn = 0
+        truncated = False
         while i < n:
             child = children[i]
             ch = h * (child.size / total)
             if ch < floor:
                 break   # children are sorted desc, so the rest are tiny too
-            # Direct children of the focus each get their own hue.
-            child_hue = (i / max(1, n)) if depth == 0 else base_hue
-            self._layout(child, x + colw, cy, ch, depth + 1, child_hue, colw, in_group)
+            if cy >= hgt:
+                truncated = True   # and so is everything after it
+                break
+            if cy + ch > 0:
+                child_hue = self._child_hue(base_hue, i, n, depth)
+                self._layout(
+                    child, x + colw, cy, ch, depth + 1, child_hue, colw, in_group
+                )
             cy += ch
+            drawn += child.size
             i += 1
 
         # Coalesce the too-small tail into one drillable aggregate block that
         # fills the leftover band, instead of leaving it blank.
-        remaining = children[i:]
         leftover_h = (y + h) - cy
         if (
             not in_group
-            and remaining
+            and not truncated
+            and i < n
             and leftover_h >= MIN_BLOCK_PX
-            and x + colw <= self.width()
+            and x + colw < w
         ):
-            group = Node(
-                f"{len(remaining)} smaller items",
-                sum(c.size for c in remaining),
-                is_group=True,
-            )
-            group.children = remaining
-            group.parent = node
+            # Reuse last frame's group for the same tail: it keeps the
+            # children slice from being copied every frame and keeps the
+            # object identity that hover/selection compare against.
+            key = (id(node), i)
+            group = self._prev_groups.get(key)
+            if group is None:
+                group = Node(
+                    f"{n - i} smaller items", node.children_size - drawn,
+                    kind="group",
+                )
+                group.children = children[i:]
+                group.parent = node
+            self._groups[key] = group
             grect = QRectF(x + colw, cy, colw, leftover_h)
-            self._blocks.append((grect, group, base_hue, depth + 1))
+            # Coloured like its first member, which is what it stands in for.
+            group_hue = self._child_hue(base_hue, i, n, depth)
+            self._blocks.append((grect, group, group_hue, depth + 1))
 
-    def _block_color(self, base_hue, depth, hovered):
-        light = min(0.78, 0.42 + depth * 0.06)
-        sat = 0.15 if depth == 0 else 0.48
-        c = QColor.fromHslF(base_hue % 1.0, sat, light)
-        if hovered:
-            c = c.lighter(122)
-        return c
+    def _child_hue(self, base_hue, i, n, depth):
+        """Hue for child `i` of `n` under a block of hue `base_hue`.
+
+        classic: direct children of the focus fan out over the wheel, deeper
+        levels inherit. rainbow: every level fans out again, starting at the
+        parent's hue so the largest child looks like its parent.
+        """
+        if self.scheme == "rainbow":
+            return (base_hue + i / max(1, n)) % 1.0
+        fan_depth = 1 if self.focus is not None and self.focus.kind == "disk" else 0
+        return (i / max(1, n)) if depth == fan_depth else base_hue
 
     @staticmethod
-    def _draw_label(p, rect, flags, text, fg):
-        """Draw text with a dark outline so it stays readable on any block."""
-        p.setPen(QColor(0, 0, 0, 235))
-        for dx, dy in (
-            (-1, -1), (0, -1), (1, -1), (-1, 0),
-            (1, 0), (-1, 1), (0, 1), (1, 1),
-        ):
+    def _is_top(node):
+        """Root of the scan (the disk wrapper does not count as a parent)."""
+        return node.parent is None or node.parent.kind == "disk"
+
+    def _focus_hue(self):
+        """Hue of the focus block: the colour it had as a child in its
+        parent's view, so drilling in keeps the left column recognisable.
+        rainbow derives it from the root chain; classic uses the position
+        among its siblings. Ignored for the top node, which is drawn grey."""
+        if self.focus is None:
+            return 0.0
+        if self.scheme == "classic":
+            if self._is_top(self.focus):
+                return 0.0
+            siblings = self.focus.parent.children
+            try:
+                return siblings.index(self.focus) / max(1, len(siblings))
+            except ValueError:
+                return 0.0
+        if self.scheme != "rainbow":
+            return 0.0
+        chain = []
+        node = self.focus
+        while node.parent is not None:
+            chain.append(node)
+            node = node.parent
+        hue = 0.0
+        for node in reversed(chain):
+            siblings = node.parent.children
+            try:
+                i = siblings.index(node)
+            except ValueError:   # synthetic group: no stable slot
+                i = 0
+            hue = (hue + i / max(1, len(siblings))) % 1.0
+        return hue
+
+    @staticmethod
+    def _abs_depth(node):
+        """Depth from the scanned root; the disk wrapper does not count."""
+        d = 0
+        while node.parent is not None and node.parent.kind != "disk":
+            d += 1
+            node = node.parent
+        return d
+
+    def _block_color(self, base_hue, depth, node=None, jitter=True):
+        if self.scheme == "spacemonger":
+            if node is not None and node.kind == "disk":
+                return QColor("#a9a9a9")   # a frame around the volume, not a level
+            ad = self._abs_depth(node) if node is not None else depth
+            return QColor(SPACEMONGER_PALETTE[ad % len(SPACEMONGER_PALETTE)])
+        light = min(0.78, 0.42 + depth * 0.06)
+        if jitter and node is not None and depth > 0:
+            jitter = zlib.crc32(node.path.encode("utf-8", "surrogateescape"))
+            light += (jitter / 0xFFFFFFFF * 2 - 1) * SHADE_JITTER
+        if depth == 0:
+            # The focus column is a frame, not data: muted, and plain grey at
+            # the top where there is no parent view to echo.
+            sat = 0.0 if node is not None and self._is_top(node) else 0.22
+        else:
+            sat = 0.48
+        return QColor.fromHslF(base_hue % 1.0, sat, min(0.9, max(0.1, light)))
+
+    @staticmethod
+    def _ink(bg):
+        """Label colours for a block: (name, size, halo), picked for contrast.
+
+        Most blocks are light, so white-on-light text used to lean entirely on
+        its outline to stay legible. Flipping the ink instead keeps the halo a
+        faint backing rather than something that thickens every glyph.
+        """
+        def lin(v):
+            return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+
+        lum = (0.2126 * lin(bg.redF()) + 0.7152 * lin(bg.greenF())
+               + 0.0722 * lin(bg.blueF()))
+        # 0.179 is where WCAG contrast against black and white is equal, so
+        # the pick is always at least 4.58:1 and the halo can stay faint. It
+        # only has to cover hovered blocks, which are drawn lighter.
+        if lum > 0.179:
+            return (QColor("#0a0a0a"), QColor("#2e2e2e"),
+                    QColor(255, 255, 255, HALO_ALPHA))
+        return QColor("#ffffff"), QColor("#e2e2e2"), QColor(0, 0, 0, HALO_ALPHA)
+
+    @staticmethod
+    def _draw_label(p, rect, flags, text, fg, halo):
+        """Back the text with a 1px halo; a heavier outline eats into the font."""
+        p.setPen(halo)
+        for dx, dy in ((0, -1), (-1, 0), (1, 0), (0, 1)):
             p.drawText(rect.translated(dx, dy), flags, text)
         p.setPen(fg)
         p.drawText(rect, flags, text)
@@ -256,49 +1014,196 @@ class IcicleWidget(QWidget):
         p.fillRect(self.rect(), QColor("#1e1f22"))
 
         if self.focus is None:
-            p.setPen(QColor("#888"))
-            p.drawText(self.rect(), Qt.AlignCenter, "No data.")
+            if self.progress is None:
+                p.setPen(QColor("#888"))
+                p.drawText(self.rect(), Qt.AlignCenter, self.empty_text)
+            else:
+                self._draw_progress(p)
             return
 
-        self._blocks = []
-        colw = self._col_width()
-        self._layout(
-            self.focus, 0.0, 0.0, float(self.height()), 0, 0.0, colw,
-            self.focus.is_group,
-        )
+        if self.zy <= 0:
+            self.fit_view(redraw=False)
+        elif self._last_h and self._last_h != self.height():
+            # Keep the same slice of the tree in view when the window resizes.
+            f = self.height() / self._last_h
+            self.zy *= f
+            self.pan_y *= f
+        self._last_h = self.height()
 
+        colw = LOGICAL_COLW * self.zx
+        self._prev_groups = self._groups
+        for _attempt in range(2):
+            self._blocks = []
+            self._groups = {}
+            self._max_depth = 1
+            self._more_right = False
+            self._layout(
+                self.focus, self.pan_x, self.pan_y, LOGICAL_H * self.zy, 0,
+                self._focus_hue(), colw, self.focus.is_group,
+            )
+            # The horizontal bound depends on the visible depth, which is only
+            # known after layout; re-clamp with fresh numbers and lay out again
+            # if that moved the view, instead of trusting the previous frame.
+            if self._anim is not None:
+                break           # animation frames are already valid views
+            pan = (self.pan_x, self.pan_y)
+            self._clamp_pan()
+            if (self.pan_x, self.pan_y) == pan:
+                break
+
+        self._revalidate_groups()
+        view = QRectF(self.rect())
         fm = QFontMetrics(self.font())
+        outlines = []
+        labels = []          # (vis rect, node, base colour, ink, ink_size, halo)
+        selected_rect = None
+        hatch = QBrush(QColor(0, 0, 0, 80), Qt.BDiagPattern)
         for rect, node, base_hue, depth in self._blocks:
+            # A zoomed-in block can be millions of pixels tall; clip it to the
+            # viewport so both the fill and its labels stay on screen.
+            vis = rect.intersected(view)
+            if vis.width() < 1 or vis.height() < 1:
+                continue
             hovered = node is self.hovered
-            if node.is_group:
-                color = QColor.fromHslF(base_hue % 1.0, 0.05, 0.30)
-                if hovered:
-                    color = color.lighter(130)
-                p.fillRect(rect, color)
-                p.fillRect(rect, Qt.BDiagPattern)   # texture marks it as grouped
-            else:
-                color = self._block_color(base_hue, depth, hovered)
-                p.fillRect(rect, color)
-            pen = QPen(QColor(0, 0, 0, 60))
-            pen.setWidth(1)
-            p.setPen(pen)
-            p.drawRect(rect)
-
-            if rect.height() >= fm.height() + 3 and rect.width() > 34:
-                inner = rect.adjusted(6, 2, -6, -2)
-                label = node.name
-                if node.is_group:
-                    label = "▸ " + label
-                name = fm.elidedText(label, Qt.ElideMiddle, int(inner.width()))
-                self._draw_label(
-                    p, inner, Qt.AlignLeft | Qt.AlignTop, name, QColor("#ffffff")
+            if node.kind == "group":
+                base = self._group_color(base_hue, depth, node)
+            elif node.kind == "free":
+                base = QColor(
+                    "#e6e6e6" if self.scheme == "spacemonger" else "#3a3d42"
                 )
-                if rect.height() >= 2 * fm.height() + 4:
-                    self._draw_label(
-                        p, inner, Qt.AlignLeft | Qt.AlignBottom,
-                        human(node.size), QColor("#e2e2e2"),
-                    )
+            else:
+                base = self._block_color(base_hue, depth, node)
+            color = base.lighter(118 if node.is_group else 122) if hovered else base
+            if self.bevel:
+                grad = QLinearGradient(vis.topLeft(), vis.bottomLeft())
+                grad.setColorAt(0.0, color.lighter(107))
+                grad.setColorAt(1.0, color.darker(109))
+                p.fillRect(vis, grad)
+            else:
+                p.fillRect(vis, color)
+            if node.is_group:
+                p.fillRect(vis, hatch)   # texture marks it as grouped
+            outlines.append(vis)
+            if node is self.selected:
+                selected_rect = vis
+            if vis.height() >= fm.height() + 3 and vis.width() > 34:
+                # Ink comes from the unhovered colour so it cannot flip on
+                # hover; only labelled blocks need it computed at all.
+                labels.append((vis, node, base) + self._ink(base))
+
+        # Edges as 1px fill strips: stroking a rect through the raster engine
+        # cost more than the whole rest of the frame once the layout itself
+        # got cheap, and fillRect is an order of magnitude faster.
+        if self.bevel:
+            light, dark = QColor(255, 255, 255, 85), QColor(0, 0, 0, 115)
+        else:
+            light = dark = QColor(0, 0, 0, 60)
+        for r in outlines:
+            x0, y0, x1, y1 = r.left(), r.top(), r.right(), r.bottom()
+            p.fillRect(QRectF(x0, y0, x1 - x0, 1), light)
+            p.fillRect(QRectF(x0, y0, 1, y1 - y0), light)
+            p.fillRect(QRectF(x0, y1 - 1, x1 - x0, 1), dark)
+            p.fillRect(QRectF(x1 - 1, y0, 1, y1 - y0), dark)
+        if selected_rect is not None:
+            pen = QPen(QColor("#ffffff"))
+            pen.setWidth(2)
+            p.setPen(pen)
+            p.drawRect(selected_rect.adjusted(1, 1, -1, -1))
+
+        for vis, node, base, ink, ink_size, halo in labels:
+            inner = vis.adjusted(6, 2, -6, -2)
+            label = node.name
+            two_lines = vis.height() >= 2 * fm.height() + 4
+            if node.is_group:
+                label = "▸ " + label
+            name = fm.elidedText(label, Qt.ElideMiddle, int(inner.width()))
+            if node.is_group:
+                # Text over the hatching, lighter still on hover, was barely
+                # legible: give each label line a solid backing in the
+                # group's own colour so the ink always sits on plain ground.
+                backing = QColor(base)
+                backing.setAlpha(235)
+                tw = fm.horizontalAdvance(name)
+                p.fillRect(QRectF(inner.left() - 3, inner.top(), tw + 6,
+                                  fm.height()), backing)
+                if two_lines:
+                    size_txt = human(node.size)
+                    tw = fm.horizontalAdvance(size_txt)
+                    p.fillRect(QRectF(inner.left() - 3,
+                                      inner.bottom() - fm.height(), tw + 6,
+                                      fm.height()), backing)
+            self._draw_label(
+                p, inner, Qt.AlignLeft | Qt.AlignTop, name, ink, halo
+            )
+            if two_lines:
+                self._draw_label(
+                    p, inner, Qt.AlignLeft | Qt.AlignBottom,
+                    human(node.size), ink_size, halo,
+                )
+        if self._fade is not None:
+            snapshot, opacity = self._fade
+            p.setOpacity(opacity)
+            p.drawPixmap(0, 0, snapshot)
+            p.setOpacity(1.0)
+        if self.progress is not None:
+            # Rescan: keep the old tree visible but clearly stale.
+            p.fillRect(self.rect(), QColor(0, 0, 0, 120))
+            self._draw_progress(p)
         p.end()
+
+    def _draw_progress(self, p):
+        path, entries, target, current, secs = self.progress
+        fm = QFontMetrics(self.font())
+        lh = fm.height()
+        pad = 18
+        pw = min(560, max(320, self.width() - 2 * pad))
+        ph = pad * 2 + lh * 3 + 30
+        panel = QRectF((self.width() - pw) / 2, (self.height() - ph) / 2, pw, ph)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        shape = QPainterPath()
+        shape.addRoundedRect(panel, 8, 8)
+        p.fillPath(shape, QColor("#2b2d31"))
+        p.setPen(QPen(QColor("#4a4d55"), 1))
+        p.drawPath(shape)
+
+        inner = panel.adjusted(pad, pad, -pad, -pad)
+        x, y, w = inner.left(), inner.top(), inner.width()
+        p.setPen(QColor("#f0f0f0"))
+        hint = "Esc cancels"
+        hint_w = fm.horizontalAdvance(hint) + 16
+        title = fm.elidedText(f"Scanning {path}", Qt.ElideMiddle, int(w - hint_w))
+        p.drawText(QRectF(x, y, w, lh), Qt.AlignLeft | Qt.AlignVCenter, title)
+        p.setPen(QColor("#8a8f98"))
+        p.drawText(QRectF(x, y, w, lh), Qt.AlignRight | Qt.AlignVCenter, hint)
+        y += lh + 6
+
+        bar = QRectF(x, y, w, 10)
+        track = QPainterPath()
+        track.addRoundedRect(bar, 5, 5)
+        p.fillPath(track, QColor("#1a1b1e"))
+        p.setClipPath(track)
+        if target:
+            frac = min(0.995, entries / target)
+            p.fillRect(QRectF(x, y, w * frac, 10), QColor("#5aa9e6"))
+            status = f"{entries:,} of ~{target:,} entries  ({frac * 100:.0f}%)"
+        else:
+            # No target: a sweeping band driven by elapsed time so it moves
+            # even while du is slow to produce the next lines.
+            span = w * 0.3
+            pos = (secs * 0.5) % 1.0 * (w + span) - span
+            p.fillRect(QRectF(x + pos, y, span, 10), QColor("#5aa9e6"))
+            status = f"{entries:,} entries"
+        p.setClipping(False)
+        y += 10 + 8
+
+        p.setPen(QColor("#c8c8c8"))
+        p.drawText(QRectF(x, y, w, lh), Qt.AlignLeft | Qt.AlignVCenter,
+                   f"{status}    {secs:.0f}s")
+        y += lh + 2
+        p.setPen(QColor("#8a8f98"))
+        cur = fm.elidedText(current or "", Qt.ElideMiddle, int(w))
+        p.drawText(QRectF(x, y, w, lh), Qt.AlignLeft | Qt.AlignVCenter, cur)
+        p.setRenderHint(QPainter.Antialiasing, False)
 
     # --- hit testing / interaction ---------------------------------------
     def _node_at(self, pos):
@@ -308,28 +1213,66 @@ class IcicleWidget(QWidget):
         return None
 
     def mouseMoveEvent(self, event):
+        if self._press_pos is not None and event.buttons() & (
+            Qt.LeftButton | Qt.MiddleButton
+        ):
+            d = event.position() - self._press_pos
+            if not self._dragging and abs(d.x()) + abs(d.y()) > DRAG_THRESHOLD:
+                self._dragging = True
+                self.setCursor(Qt.ClosedHandCursor)
+            if self._dragging:
+                self.pan_x = self._drag_origin[0] + d.x()
+                self.pan_y = self._drag_origin[1] + d.y()
+                self._clamp_pan()
+                self.update()
+                return
         node = self._node_at(event.position())
         if node is not self.hovered:
             self.hovered = node
             if node is not None:
-                self.setToolTip(f"{node.path}\n{human(node.size)}")
+                self.setToolTip(f"{node.name if node.synthetic else node.path}"
+                                f"\n{human(node.size)}")
             else:
                 self.setToolTip("")
             self.update()
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            node = self._node_at(event.position())
+            if node is not None:
+                self._context_menu(node, event.globalPosition().toPoint())
+            return
+        if event.button() in (Qt.LeftButton, Qt.MiddleButton):
+            self._stop_anim()
+            self._press_pos = event.position()
+            self._drag_origin = (self.pan_x, self.pan_y)
+            self._dragging = False
+
+    def mouseReleaseEvent(self, event):
+        was_drag = self._dragging
+        self._press_pos = None
+        self._drag_origin = None
+        self._dragging = False
+        self.unsetCursor()
+        if not was_drag and event.button() == Qt.LeftButton:
+            self.set_selected(self._node_at(event.position()))
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
         node = self._node_at(event.position())
         if node is None:
             return
-        if event.button() == Qt.LeftButton:
-            if node is self.focus:
-                self.go_up()
-            elif node.children:
-                self.set_focus(node)
-        elif event.button() == Qt.RightButton:
-            self._context_menu(node, event.globalPosition().toPoint())
+        if node is self.focus:
+            self.go_up()
+        elif node.children:
+            self.navigate(node)
 
     def _context_menu(self, node, global_pos):
+        if node.kind == "disk":
+            node = next((c for c in node.children if c.kind is None), node)
+        if node.synthetic:
+            return
         menu = QMenu(self)
         folder = node.path if node.children else os.path.dirname(node.path)
         act_open = QAction("Open in file manager", self)
@@ -344,9 +1287,16 @@ class IcicleWidget(QWidget):
 
     def keyPressEvent(self, event):
         key = event.key()
-        if key in (Qt.Key_Backspace, Qt.Key_Escape):
-            if not self.go_up() and key == Qt.Key_Escape:
-                self.window().close()
+        if key == Qt.Key_Escape and self.progress is not None:
+            self.cancel_requested.emit()
+        elif key in (Qt.Key_Backspace, Qt.Key_Escape):
+            self.go_up()
+        elif key in (Qt.Key_0, Qt.Key_Home):
+            self.fit_view(animate=True)
+        elif key in (Qt.Key_Plus, Qt.Key_Equal, Qt.Key_Minus):
+            center = QPointF(self.width() / 2.0, self.height() / 2.0)
+            f = 1.0 / KEY_ZOOM_STEP if key == Qt.Key_Minus else KEY_ZOOM_STEP
+            self._zoom_at(center, f)
         else:
             super().keyPressEvent(event)
 
@@ -358,14 +1308,124 @@ def _open_folder(path):
         pass
 
 
+def make_icon(kind, color):
+    """A small line icon drawn in code, so the toolbar has one consistent
+    style regardless of what the desktop icon theme does or does not ship.
+
+    Drawn on a 24-unit grid with a 1.8 unit stroke, rendered at 2x for
+    HiDPI as well.
+    """
+    icon = QIcon()
+    for size, dpr in ((16, 1), (22, 1), (32, 1), (22, 2), (32, 2)):
+        px = size * dpr
+        pm = QPixmap(px, px)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.scale(px / 24.0, px / 24.0)
+        pen = QPen(color, 1.8)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        _ICON_PAINTERS[kind](p, color)
+        p.end()
+        pm.setDevicePixelRatio(dpr)
+        icon.addPixmap(pm)
+    return icon
+
+
+def _icon_open(p, _c):
+    path = QPainterPath()
+    path.moveTo(3, 6.5)
+    path.lineTo(3, 19)
+    path.lineTo(21, 19)
+    path.lineTo(21, 9)
+    path.lineTo(11.5, 9)
+    path.lineTo(9.5, 6.5)
+    path.closeSubpath()
+    p.drawPath(path)
+    p.drawLine(QPointF(3, 12), QPointF(21, 12))
+
+
+def _icon_rescan(p, c):
+    p.drawArc(QRectF(4, 4, 16, 16), 40 * 16, 280 * 16)
+    head = QPainterPath()
+    head.moveTo(19.5, 3.5)
+    head.lineTo(20, 9)
+    head.lineTo(14.5, 8.5)
+    p.setBrush(c)
+    p.drawPath(head)
+
+
+def _icon_fit(p, _c):
+    for sx, sy in ((1, 1), (-1, 1), (1, -1), (-1, -1)):
+        cx, cy = 12 - sx * 8.5, 12 - sy * 8.5
+        p.drawLine(QPointF(cx, cy), QPointF(cx + sx * 5, cy))
+        p.drawLine(QPointF(cx, cy), QPointF(cx, cy + sy * 5))
+    p.drawRect(QRectF(8.5, 8.5, 7, 7))
+
+
+def _icon_stop(p, c):
+    p.drawEllipse(QRectF(3, 3, 18, 18))
+    p.setBrush(c)
+    p.setPen(Qt.NoPen)
+    p.drawRoundedRect(QRectF(8.5, 8.5, 7, 7), 1, 1)
+
+
+def _icon_drive(p, c):
+    p.drawEllipse(QRectF(4, 3.5, 16, 6))
+    p.drawLine(QPointF(4, 6.5), QPointF(4, 17.5))
+    p.drawLine(QPointF(20, 6.5), QPointF(20, 17.5))
+    p.drawArc(QRectF(4, 14.5, 16, 6), 180 * 16, 180 * 16)
+    p.setBrush(c)
+    p.setPen(Qt.NoPen)
+    p.drawEllipse(QRectF(15.5, 13.5, 2.4, 2.4))
+
+
+def _icon_colors(p, c):
+    p.drawEllipse(QRectF(3.5, 3.5, 17, 17))
+    p.setBrush(c)
+    p.setPen(Qt.NoPen)
+    for cx, cy in ((8.5, 9), (12.5, 6.5), (16.5, 9.5), (8.5, 14)):
+        p.drawEllipse(QPointF(cx, cy), 1.5, 1.5)
+    p.setPen(QPen(c, 1.8))
+    p.setBrush(Qt.NoBrush)
+    p.drawLine(QPointF(14.5, 15.5), QPointF(17.5, 18.5))
+
+
+def _icon_cube(p, _c):
+    top = QPainterPath()
+    top.moveTo(12, 3.5)
+    top.lineTo(20, 8)
+    top.lineTo(12, 12.5)
+    top.lineTo(4, 8)
+    top.closeSubpath()
+    p.drawPath(top)
+    p.drawLine(QPointF(4, 8), QPointF(4, 16.5))
+    p.drawLine(QPointF(20, 8), QPointF(20, 16.5))
+    p.drawLine(QPointF(12, 12.5), QPointF(12, 21))
+    p.drawLine(QPointF(4, 16.5), QPointF(12, 21))
+    p.drawLine(QPointF(20, 16.5), QPointF(12, 21))
+
+
+_ICON_PAINTERS = {
+    "open": _icon_open,
+    "rescan": _icon_rescan,
+    "fit": _icon_fit,
+    "stop": _icon_stop,
+    "drive": _icon_drive,
+    "colors": _icon_colors,
+    "cube": _icon_cube,
+}
+
+
 class Breadcrumb(QWidget):
     """A row of clickable buttons for the path from root to focus."""
 
     def __init__(self, icicle):
         super().__init__()
         self.icicle = icicle
-        from PySide6.QtWidgets import QHBoxLayout
-
         self._layout = QHBoxLayout(self)
         self._layout.setContentsMargins(6, 4, 6, 4)
         self._layout.setSpacing(2)
@@ -387,7 +1447,7 @@ class Breadcrumb(QWidget):
             btn = QPushButton(node.name or "/")
             btn.setFlat(True)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _=False, n=node: self.icicle.set_focus(n))
+            btn.clicked.connect(lambda _=False, n=node: self.icicle.navigate(n))
             self._layout.addWidget(btn)
             if i < len(chain) - 1:
                 sep = QLabel("›")
@@ -397,20 +1457,42 @@ class Breadcrumb(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, path, one_fs):
+    def __init__(self, path, one_fs, scheme=None, style=None):
         super().__init__()
         self.one_fs = one_fs
+        self.settings = QSettings("spacequilt", "spacequilt")
+        if scheme is None:
+            scheme = self.settings.value("colors", DEFAULT_SCHEME)
+            if scheme not in COLOR_SCHEMES:
+                scheme = DEFAULT_SCHEME
+        if style is None:
+            style = self.settings.value("style", DEFAULT_STYLE)
+            if style not in STYLES:
+                style = DEFAULT_STYLE
         self.scanner = None
+        self._stopping = []          # scanners still winding down
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(100)
+        self._progress_timer.timeout.connect(self._poll_progress)
+        self._selected = None
+        self._current_path = os.path.abspath(path)
         self.setWindowTitle("spacequilt")
         self.resize(1000, 640)
+        geometry = self.settings.value("window/geometry")
+        if geometry is not None:
+            # Size, maximised state and screen; Wayland compositors ignore
+            # the position part and place the window themselves.
+            self.restoreGeometry(geometry)
 
         self.icicle = IcicleWidget()
+        self.icicle.set_scheme(scheme)
+        self.icicle.set_bevel(style == "bevel")
         self.breadcrumb = Breadcrumb(self.icicle)
         self.icicle.focus_changed.connect(self._on_focus)
+        self.icicle.selection_changed.connect(self._on_selection)
+        self.icicle.cancel_requested.connect(self.cancel_scan)
 
         central = QWidget()
-        from PySide6.QtWidgets import QVBoxLayout
-
         v = QVBoxLayout(central)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
@@ -420,45 +1502,248 @@ class MainWindow(QMainWindow):
 
         tb = self.addToolBar("main")
         tb.setMovable(False)
-        act_open = QAction("Open…", self)
+        tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        act_open = QAction(self._icon("open"), "Open…", self)
         act_open.setShortcut("Ctrl+O")
         act_open.triggered.connect(self._pick_dir)
-        act_rescan = QAction("Rescan", self)
+        act_rescan = QAction(self._icon("rescan"), "Rescan", self)
         act_rescan.setShortcut("Ctrl+R")
         act_rescan.triggered.connect(self._rescan)
+        self.act_stop = QAction(self._icon("stop"), "Stop", self)
+        self.act_stop.setToolTip("Cancel the running scan (Esc)")
+        self.act_stop.setEnabled(False)
+        self.act_stop.triggered.connect(self.cancel_scan)
+        self.act_one_fs = QAction(self._icon("drive"), "One filesystem", self)
+        self.act_one_fs.setCheckable(True)
+        self.act_one_fs.setChecked(one_fs)
+        self.act_one_fs.setShortcut("Ctrl+M")
+        self.act_one_fs.setToolTip(
+            "<b>One filesystem</b> (Ctrl+M)<br>"
+            "When on, the scan stops at mount points and measures only the "
+            "filesystem the scanned directory lives on, so scanning <tt>/</tt> "
+            "shows the root volume instead of every mounted disk, "
+            "<tt>/proc</tt> or <tt>/sys</tt> as well (du -x).<br>"
+            "Toggling it rescans."
+        )
+        self.act_one_fs.triggered.connect(self._toggle_one_fs)
+        act_fit = QAction(self._icon("fit"), "Fit", self)
+        act_fit.setShortcut("Ctrl+0")
+        act_fit.setToolTip("Reset zoom and pan to fit the current focus")
+        act_fit.triggered.connect(
+            lambda _checked=False: self.icicle.fit_view(animate=True)
+        )
+        self.act_bevel = QAction(self._icon("cube"), "3D", self)
+        self.act_bevel.setCheckable(True)
+        self.act_bevel.setChecked(style == "bevel")
+        self.act_bevel.setToolTip("Raised blocks: light top/left edge, dark "
+                                  "bottom/right edge and a soft gradient")
+        self.act_bevel.toggled.connect(self._set_bevel)
         tb.addAction(act_open)
         tb.addAction(act_rescan)
+        tb.addAction(self.act_stop)
+        tb.addAction(act_fit)
+        tb.addSeparator()
+        tb.addAction(self.act_one_fs)
+        tb.addSeparator()
+        tb.addWidget(self._colors_button(scheme))
+        tb.addAction(self.act_bevel)
 
         self.statusBar().showMessage("Ready.")
         self.scan(path)
 
+    def _icon(self, kind):
+        return make_icon(kind, self.palette().buttonText().color())
+
+    def _set_bevel(self, on):
+        self.icicle.set_bevel(on)
+        self.settings.setValue("style", "bevel" if on else "flat")
+
+    def _colors_button(self, current):
+        labels = {
+            "classic": ("Classic", "One hue per top-level entry, lighter with depth"),
+            "spacemonger": ("SpaceMonger", "Fixed pastel palette cycling by depth"),
+            "rainbow": ("Rainbow", "Every level re-spreads the hues; the first "
+                                   "child keeps its parent's"),
+        }
+        menu = QMenu(self)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        for scheme in COLOR_SCHEMES:
+            text, tip = labels[scheme]
+            act = QAction(text, self)
+            act.setCheckable(True)
+            act.setChecked(scheme == current)
+            act.setToolTip(tip)
+            act.setData(scheme)
+            group.addAction(act)
+            menu.addAction(act)
+        group.triggered.connect(self._set_scheme)
+        btn = QToolButton(self)
+        btn.setText("Colors")
+        btn.setIcon(self._icon("colors"))
+        btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        btn.setToolTip("Colour scheme of the blocks")
+        btn.setMenu(menu)
+        btn.setPopupMode(QToolButton.InstantPopup)
+        return btn
+
+    def _set_scheme(self, action):
+        scheme = action.data()
+        self.icicle.set_scheme(scheme)
+        self.settings.setValue("colors", scheme)
+
     def _on_focus(self, node):
         self.breadcrumb.rebuild(node)
-        self.statusBar().showMessage(f"{node.path}    {human(node.size)}")
+        self._selected = None
+        self._update_status()
+
+    def _on_selection(self, node):
+        self._selected = node
+        self._update_status()
+
+    def _update_status(self):
+        node = self._selected or self.icicle.focus
+        if node is None:
+            return
+        if node.kind == "disk":
+            self.statusBar().showMessage(volume_status(node))
+        elif node.synthetic:
+            self.statusBar().showMessage(f"{node.name}    {human(node.size)}")
+        else:
+            self.statusBar().showMessage(f"{node.path}    {human(node.size)}")
 
     def scan(self, path):
         path = os.path.abspath(path)
         if not os.path.isdir(path):
             QMessageBox.warning(self, "spacequilt", f"Not a directory:\n{path}")
             return
+        # A scan still running would keep burning IO and could land its result
+        # on top of this one.
+        self.stop_scan()
         self._current_path = path
+        self.setWindowTitle(f"{path} - spacequilt")
         self.statusBar().showMessage(f"Scanning {path} …")
-        self.setEnabled(True)
-        self.scanner = Scanner(path, self.one_fs)
-        self.scanner.done.connect(self._on_scan_done)
-        self.scanner.failed.connect(self._on_scan_failed)
+        self.act_stop.setEnabled(True)
+        expected = self.settings.value(self._entries_key(path), None)
+        self.scanner = Scanner(
+            path, self.one_fs, int(expected) if expected else None
+        )
+        scanner = self.scanner
+        scanner.done.connect(lambda root: self._on_scan_done(root, scanner))
+        scanner.failed.connect(lambda msg: self._on_scan_failed(msg, scanner))
         self.scanner.start()
+        self._poll_progress()
+        self._progress_timer.start()
 
-    def _on_scan_done(self, root):
+    @staticmethod
+    def _entries_key(path):
+        # QSettings treats "/" as a group separator, so the path is encoded.
+        return "scan_entries/" + path.replace("/", "%2F")
+
+    def _poll_progress(self):
+        if self.scanner is None:
+            return
+        entries, target, current, secs = self.scanner.progress()
+        self.icicle.set_progress(
+            (self._current_path, entries, target, current, secs)
+        )
+        if target:
+            pct = min(99, int(100 * entries / target))
+            self.statusBar().showMessage(
+                f"Scanning {self._current_path} …  {entries:,} entries ({pct}%)"
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Scanning {self._current_path} …  {entries:,} entries"
+            )
+
+    def _end_progress(self):
+        self._progress_timer.stop()
+        self.act_stop.setEnabled(False)
+        self.icicle.set_progress(None)
+
+    def cancel_scan(self):
+        """Abort the running scan; whatever was on screen before stays."""
+        if self.scanner is None:
+            return
+        self.stop_scan()
+        self._end_progress()
+        self.icicle.empty_text = (
+            "Scan cancelled.  Ctrl+R rescans, Ctrl+O opens another directory."
+        )
+        self.icicle.update()
+        self.statusBar().showMessage(f"Scan of {self._current_path} cancelled.")
+
+    def _on_scan_done(self, root, scanner):
+        if scanner is not self.scanner:
+            return              # superseded or cancelled while it was finishing
+        if scanner.builder is not None:
+            # Next scan of this path gets a real progress bar from this count.
+            self.settings.setValue(
+                self._entries_key(scanner.path), scanner.builder.count()
+            )
+        self._end_progress()
         self.icicle.set_root(root)
-        self.statusBar().showMessage(f"{root.path}    {human(root.size)}")
+        self._update_status()
 
-    def _on_scan_failed(self, msg):
+    def _on_scan_failed(self, msg, scanner):
+        if scanner is not self.scanner:
+            return
+        self._end_progress()
         QMessageBox.critical(self, "spacequilt", f"Scan failed:\n{msg}")
         self.statusBar().showMessage("Scan failed.")
 
+    def stop_scan(self, timeout_ms=2000):
+        scanner, self.scanner = self.scanner, None
+        if scanner is None:
+            return
+        scanner.abort()
+        if not scanner.wait(timeout_ms):
+            # Freeing a QThread that is still running aborts the process.
+            self._stopping.append(scanner)
+
+    def closeEvent(self, event):
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        self.stop_scan()
+        self.wait_scanners()
+        super().closeEvent(event)
+
+    def wait_scanners(self):
+        """Block until every aborted scanner thread has ended: a QThread that
+        is still running when its object is destroyed aborts the process."""
+        for scanner in self._stopping:
+            scanner.wait()
+        self._stopping = []
+
     def _rescan(self):
         self.scan(self._current_path)
+
+    def _toggle_one_fs(self, checked):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("One filesystem")
+        box.setText("Stay on one filesystem" if checked else "Cross filesystems")
+        box.setInformativeText(
+            ("The scan will stop at mount points and measure only the "
+             "filesystem that the scanned directory lives on (du -x). "
+             "Scanning / then shows the root volume alone, without other "
+             "mounted disks, /proc or /sys."
+             if checked else
+             "The scan will descend into every filesystem mounted under the "
+             "scanned directory, so the sizes add up across disks.")
+            + "\n\nChanging this rescans the current directory now."
+        )
+        rescan = box.addButton("Rescan", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(rescan)
+        box.exec()
+        if box.clickedButton() is not rescan:
+            self.act_one_fs.blockSignals(True)
+            self.act_one_fs.setChecked(not checked)
+            self.act_one_fs.blockSignals(False)
+            return
+        self.one_fs = checked
+        self._rescan()
 
     def _pick_dir(self):
         path = QFileDialog.getExistingDirectory(
@@ -466,6 +1751,28 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.scan(path)
+
+
+def _install_signal_handlers(app, win):
+    """Make Ctrl+C in the terminal work.
+
+    Qt's event loop blocks inside C, so Python never gets to run its signal
+    handler and SIGINT is swallowed until the next event. An idle timer hands
+    the interpreter a slot often enough to notice.
+    """
+    def handler(*_args):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, signal.SIG_DFL)   # a second one is fatal
+        win.stop_scan(500)
+        win.wait_scanners()
+        app.quit()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, handler)
+    timer = QTimer(app)
+    timer.timeout.connect(lambda: None)
+    timer.start(200)
+    return timer
 
 
 def main():
@@ -476,14 +1783,47 @@ def main():
     parser.add_argument(
         "-x",
         "--one-filesystem",
+        dest="one_filesystem",
         action="store_true",
-        help="Do not cross filesystem boundaries (du -x).",
+        default=True,
+        help="Do not cross filesystem boundaries (du -x). This is the default.",
+    )
+    parser.add_argument(
+        "-X",
+        "--cross-filesystems",
+        dest="one_filesystem",
+        action="store_false",
+        help="Descend into other mounted filesystems as well.",
+    )
+    parser.add_argument(
+        "--colors",
+        choices=COLOR_SCHEMES,
+        default=None,
+        help="Colour scheme for this run (also remembered as the new default). "
+             "Without it the last choice from the toolbar is used.",
+    )
+    parser.add_argument(
+        "--style",
+        choices=STYLES,
+        default=None,
+        help="Block style for this run: flat, or bevel for raised 3D-ish "
+             "tiles (also remembered as the new default).",
     )
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
     app.setApplicationName("spacequilt")
-    win = MainWindow(args.path, args.one_filesystem)
+    # Wayland shows the icon the compositor finds for this desktop id, so both
+    # the id and the window icon have to be set for it to appear everywhere.
+    app.setDesktopFileName("spacequilt")
+    if os.path.exists(ICON_PATH):
+        app.setWindowIcon(QIcon(ICON_PATH))
+    win = MainWindow(args.path, args.one_filesystem, args.colors, args.style)
+    if args.colors:
+        win.settings.setValue("colors", args.colors)
+    if args.style:
+        win.settings.setValue("style", args.style)
+    _sigint_timer = _install_signal_handlers(app, win)   # noqa: F841 (keep alive)
     win.show()
     sys.exit(app.exec())
 
