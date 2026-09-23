@@ -8,21 +8,26 @@ to drill into it; use the breadcrumb or Backspace to go back out.
 Usage:
     spacequilt [PATH] [-X/--cross-filesystems] [--colors SCHEME]
 
-  PATH               Directory to scan. Default: current directory.
+  PATH               Directory to scan. Without it a page lists the mounted
+                     volumes and recent scans to pick from (also Ctrl+O).
   -X, --cross-filesystems  Descend into other mounted filesystems too. By
                      default du is run with -x, so scanning / measures just
                      the root filesystem instead of every mount under it.
                      Scanning a mount point also shows the volume's free
                      space as a block next to the scanned directory.
-  --colors SCHEME    classic (hue per top-level child, lighter with depth),
-                     spacemonger (fixed palette cycling by depth), or rainbow
+  --colors SCHEME    branches (hue per top-level entry, lighter with depth),
+                     levels (fixed palette cycling by depth), or rainbow
                      (every level re-spreads the hues, first child keeps the
                      parent's). Remembered between runs; the toolbar has the
                      same choice.
-  --style STYLE      bevel (default) or flat. bevel: blocks get a light top/left
-                     edge, a dark bottom/right edge and a soft gradient, a
-                     nod to SpaceMonger's raised tiles. Remembered too; the
-                     toolbar's 3D toggle is the same switch.
+  --view VIEW        icicle (default): size-proportional columns, one per
+                     depth. boxes: SpaceMonger-style nested rectangles, each
+                     directory a titled box with its children packed inside.
+                     Remembered; Ctrl+1 / Ctrl+2 or the toolbar switch live.
+  --style STYLE      Relief: flat, raised (default: light top/left edge, dark
+                     bottom/right edge, soft gradient, sunken content areas
+                     in the boxes view) or deep (the same, twice as strong).
+                     Remembered too; the toolbar's Style menu is the same.
 
 Interaction:
   Wheel             Zoom continuously around the cursor.
@@ -36,10 +41,12 @@ Interaction:
   Ctrl+R            Rescan the current root.
   Ctrl+O            Pick a new directory to scan.
   Ctrl+M            Toggle staying on one filesystem.
+  Ctrl+1 / Ctrl+2   Icicle view / boxes view.
   Esc               Cancel a running scan, otherwise go up one level.
 """
 
 import argparse
+import array
 import gc
 import math
 import operator
@@ -79,6 +86,7 @@ from PySide6.QtGui import (
     QPainter,
     QPen,
     QPixmap,
+    QTransform,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -87,8 +95,12 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMenu,
+    QFrame,
     QMessageBox,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
+    QStackedWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -114,7 +126,8 @@ KEY_ZOOM_STEP = 1.25
 FIT_ANIM_MS = 320
 NAV_ANIM_MS = 360           # drill in / out
 FADE_MS = 220               # crossfade over the colour change at a focus switch
-ZOOM_OUT_LIMIT = 0.25       # both limits are relative to the fit zoom
+ZOOM_OUT_LIMIT = 1.0        # both limits are relative to the fit zoom; below
+                            # the fit there is nothing more to see
 ZOOM_IN_CAP = 1e7
 ZOOM_IN_UNIT = 4096.0       # stop zooming near "one screen = one disk block"
 COLW_MIN_PX, COLW_MAX_PX = 14.0, 900.0
@@ -123,10 +136,24 @@ HALO_ALPHA = 60             # heavier than this visibly thins the glyphs
 # Per-node lightness jitter (+-), hashed from the path so it is stable across
 # rescans. Adjacent same-hue siblings stay distinguishable while scrolling.
 SHADE_JITTER = 0.05
-COLOR_SCHEMES = ("classic", "spacemonger", "rainbow")
-DEFAULT_SCHEME = "classic"
-STYLES = ("flat", "bevel")
-DEFAULT_STYLE = "bevel"
+COLOR_SCHEMES = ("branches", "levels", "rainbow")
+DEFAULT_SCHEME = "branches"
+STYLES = ("flat", "raised", "deep")
+DEFAULT_STYLE = "raised"
+# Earlier names of settings values, mapped on load.
+LEGACY_VALUES = {"classic": "branches", "spacemonger": "levels", "bevel": "raised"}
+VIEWS = ("icicle", "boxes")
+DEFAULT_VIEW = "icicle"
+# Boxes view: nested rectangles with a title bar per directory.
+BOX_INSET = 3.0             # px between a box's frame and its children
+BOX_TITLE_PAD = 2.0         # px above/below the title text
+MIN_BOX_PX = 8.0            # children smaller than this on a side are aggregated
+SMALL_BOX_PX = 16.0         # below this, boxes get a flat fill and no edge strips
+BOX_BUDGET = 5000           # about this many boxes per frame at most: the
+                            # minimum box area scales with the widget area
+LAYOUT_BUDGET = 600000      # cached layout entries before the cache is dropped
+                            # (layouts are deterministic, so dropping is safe)
+BOX_ZOOM_OUT_LIMIT = 1.0    # relative to the fit
 # SpaceMonger's look: one flat pastel per depth counted from the scanned root,
 # cycling. Approximated from screenshots, in depth order.
 SPACEMONGER_PALETTE = (
@@ -187,6 +214,26 @@ class Node:
             return self.path
         base = os.path.basename(self.path.rstrip("/"))
         return base or self.path   # root ("/") keeps its full path
+
+
+# Dot stipple over "N smaller items" areas, as SpaceMonger 2 drew the parts
+# too small to resolve. Alpha is what keeps it a texture rather than a tone.
+STIPPLE = None   # QBrush, created once a QGuiApplication exists (see _stipple)
+
+
+def _stipple():
+    global STIPPLE
+    if STIPPLE is None:
+        # 2px dots on a 6px diagonal grid: coarse enough to read as dots, not
+        # as a darker tone (the 1px checkerboard patterns blur into one).
+        tile = QPixmap(6, 6)
+        tile.fill(Qt.transparent)
+        p = QPainter(tile)
+        p.fillRect(0, 0, 2, 2, QColor(0, 0, 0, 105))
+        p.fillRect(3, 3, 2, 2, QColor(0, 0, 0, 105))
+        p.end()
+        STIPPLE = QBrush(tile)
+    return STIPPLE
 
 
 def human(size):
@@ -271,8 +318,12 @@ class TreeBuilder:
 
         by_size = operator.attrgetter("size")
         for node in nodes.values():
-            if node.children:
-                node.children.sort(key=by_size, reverse=True)
+            kids = node.children
+            if kids:
+                kids.sort(key=by_size, reverse=True)
+                # Summed here, off the GUI thread: the boxes view touches
+                # every visible directory's total on its first frame.
+                node._kids = sum(c.size for c in kids)
         # The tree holds every node from here on; keeping the path index too
         # would double the memory for nothing.
         self.entries = len(nodes)
@@ -454,10 +505,15 @@ class Scanner(QThread):
                 pass
 
 
-class IcicleWidget(QWidget):
+class TreeView(QWidget):
+    """What the two views share: the tree, focus/selection/hover, colour
+    schemes, labels, the scanning overlay, crossfades, mouse and keyboard
+    handling. A view adds a viewport, a layout that fills `_blocks` with
+    (rect, node, hue, depth) in screen pixels, and its painting."""
     focus_changed = Signal(object)       # emits the new focus Node
     selection_changed = Signal(object)   # emits the selected Node, or None
     cancel_requested = Signal()          # Esc while a scan is running
+
 
     def __init__(self):
         super().__init__()
@@ -465,7 +521,7 @@ class IcicleWidget(QWidget):
         self.root = None
         self.focus = None
         self.scheme = DEFAULT_SCHEME
-        self.bevel = False
+        self.relief = STYLES.index(DEFAULT_STYLE)   # 0 flat, 1 raised, 2 deep
         self.progress = None         # (path, entries, target, current, secs) while scanning
         self.empty_text = "No data."
         self.hovered = None
@@ -473,25 +529,24 @@ class IcicleWidget(QWidget):
         self._blocks = []            # (QRectF, node, base_hue, depth)
         self._groups = {}            # (id(parent), first index) -> group Node
         self._prev_groups = {}       # same, from the previous frame
-        # Viewport. Layout happens in a logical space where the focus node is
-        # LOGICAL_H tall and one column is LOGICAL_COLW wide; zx/zy/pan map it
-        # to pixels. Blocks are laid out in screen pixels directly, so zooming
-        # in subdivides deeper levels instead of just magnifying the same ones.
-        self.zy = 0.0                # 0 until the first fit
-        self.hx = 1.0                # horizontal offset on top of the damped zy
+        self._color_cache = {}       # (id(node), hue, depth) -> base QColor
+        self._ink_cache = {}         # rgb -> (ink, size ink, halo)
         self._anim = None            # running viewport animation, if any
         self._fade = None            # (snapshot pixmap, opacity) during a crossfade
         self._fade_anim = None
-        self.pan_x = 0.0
+        self.pan_x = 0.0             # both views pan in pixels
         self.pan_y = 0.0
-        self._max_depth = 1          # deepest column last frame, for pan limits
-        self._more_right = False     # tree continues past the right edge
-        self._last_h = 0             # widget height at the last layout
         self._press_pos = None
         self._drag_origin = None
         self._dragging = False
+        # A real button over the painted scan panel; placed by _draw_progress.
+        self._cancel_btn = QPushButton("Cancel", self)
+        self._cancel_btn.setCursor(Qt.PointingHandCursor)
+        self._cancel_btn.clicked.connect(self.cancel_requested)
+        self._cancel_btn.hide()
         self.setMinimumSize(480, 320)
         self.setFocusPolicy(Qt.StrongFocus)
+
 
     def set_root(self, root):
         self.root = root
@@ -499,7 +554,9 @@ class IcicleWidget(QWidget):
         self._stop_fade()
         self._groups = {}
         self._prev_groups = {}
+        self._color_cache = {}
         self.set_focus(root)
+
 
     def set_focus(self, node):
         if node is None:
@@ -511,27 +568,42 @@ class IcicleWidget(QWidget):
         self.focus_changed.emit(node)
         self.update()
 
+
     def set_progress(self, progress):
         """Show (or with None, hide) the scanning overlay."""
         self.progress = progress
+        if progress is None:
+            self._cancel_btn.hide()
         self.update()
+
 
     def set_scheme(self, scheme):
         if scheme not in COLOR_SCHEMES:
             raise ValueError(scheme)
         self.scheme = scheme
+        self._color_cache = {}
         self.update()
 
-    def set_bevel(self, on):
-        self.bevel = bool(on)
+
+    def set_style(self, style):
+        if style not in STYLES:
+            raise ValueError(style)
+        self.relief = STYLES.index(style)
         self.update()
+
+    @property
+    def bevel(self):
+        return self.relief > 0
+
 
     def _group_color(self, hue, depth, group):
-        """Groups keep the tint of the blocks they stand in for, muted and
-        dark, so they read as "part of this branch" instead of dead grey."""
+        """Groups are the unresolved part of their branch: its colour, a
+        little muted, under a dot stipple (see STIPPLE). Not a dark hole."""
         base = self._block_color(hue, depth, group, jitter=False)
         h = max(0.0, base.hslHueF())        # -1 for achromatic colours
-        return QColor.fromHslF(h, base.hslSaturationF() * 0.45, 0.30)
+        return QColor.fromHslF(h, base.hslSaturationF() * 0.8,
+                               max(0.12, base.lightnessF() * 0.86))
+
 
     def set_selected(self, node):
         if node is self.selected:
@@ -540,29 +612,501 @@ class IcicleWidget(QWidget):
         self.selection_changed.emit(node)
         self.update()
 
+
     def go_up(self):
         if self.focus is not None and self.focus.parent is not None:
             self.navigate(self.focus.parent)
             return True
         return False
 
+    # --- hooks a view implements ------------------------------------------
+    def fit_view(self, redraw=True, animate=False):
+        raise NotImplementedError
+
+    def navigate(self, node):
+        raise NotImplementedError
+
+    def zoom_step(self, pos, factor):
+        """Uniform zoom about `pos` by `factor` (keyboard +/-)."""
+        raise NotImplementedError
+
+    def _clamp_pan(self):
+        raise NotImplementedError
+
+    def _paint_content(self, p):
+        """Lay the focus out into `_blocks` and draw it."""
+        raise NotImplementedError
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        p.fillRect(self.rect(), QColor("#1e1f22"))
+        if self.focus is None:
+            if self.progress is None:
+                p.setPen(QColor("#888"))
+                p.drawText(self.rect(), Qt.AlignCenter, self.empty_text)
+            else:
+                self._draw_progress(p)
+            return
+        self._paint_content(p)
+        if self._fade is not None:
+            snapshot, opacity = self._fade
+            p.setOpacity(opacity)
+            p.drawPixmap(0, 0, snapshot)
+            p.setOpacity(1.0)
+        if self.progress is not None:
+            # Rescan: keep the old tree visible but clearly stale.
+            p.fillRect(self.rect(), QColor(0, 0, 0, 120))
+            self._draw_progress(p)
+        p.end()
+
+    def _base_color(self, node, hue, depth):
+        """Unhovered colour of a block of any kind, cached per frame-stable key
+        (groups are recreated on zoom, so their ids churn, but they are few)."""
+        key = (id(node), hue, depth)
+        color = self._color_cache.get(key)
+        if color is None:
+            if node.kind == "group":
+                color = self._group_color(hue, depth, node)
+            elif node.kind == "free":
+                color = QColor("#e6e6e6" if self.scheme == "levels" else "#3a3d42")
+            else:
+                color = self._block_color(hue, depth, node)
+            if len(self._color_cache) > 200000:
+                self._color_cache.clear()
+            self._color_cache[key] = color
+        return color
+
+    # Per relief level: (gradient light %, gradient dark %, edge px,
+    # light edge alpha, dark edge alpha).
+    RELIEF = ((100, 100, 1, 0, 60), (107, 109, 1, 85, 115), (115, 117, 2, 120, 150))
+
+    def _fill_block(self, p, rect, color):
+        """Flat or gradient fill, per the relief level."""
+        if self.relief:
+            lighter, darker = self.RELIEF[self.relief][:2]
+            grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+            grad.setColorAt(0.0, color.lighter(lighter))
+            grad.setColorAt(1.0, color.darker(darker))
+            p.fillRect(rect, grad)
+        else:
+            p.fillRect(rect, color)
+
+    def _draw_edges(self, p, rects, sunken=False):
+        """Edges as fill strips: stroking a rect through the raster engine cost
+        more than the whole rest of the frame once the layout itself got
+        cheap, and fillRect is an order of magnitude faster. Raised: light
+        top/left, dark bottom/right; sunken: the other way round."""
+        _l, _d, px, la, da = self.RELIEF[self.relief]
+        if not self.relief:
+            if sunken:
+                return          # flat: the children's own outlines suffice
+            light = dark = QColor(0, 0, 0, da)
+        else:
+            light, dark = QColor(255, 255, 255, la), QColor(0, 0, 0, da)
+            if sunken:
+                light, dark = dark, light
+        for r in rects:
+            x0, y0, x1, y1 = r.left(), r.top(), r.right(), r.bottom()
+            p.fillRect(QRectF(x0, y0, x1 - x0, px), light)
+            p.fillRect(QRectF(x0, y0, px, y1 - y0), light)
+            p.fillRect(QRectF(x0, y1 - px, x1 - x0, px), dark)
+            p.fillRect(QRectF(x1 - px, y0, px, y1 - y0), dark)
+
+    def _draw_selection(self, p, rect):
+        pen = QPen(QColor("#ffffff"))
+        pen.setWidth(2)
+        p.setPen(pen)
+        p.drawRect(rect.adjusted(1, 1, -1, -1))
+
+
+    def _stop_anim(self):
+        anim = self._anim
+        if anim is not None:
+            self._anim = None
+            anim.stop()
+
+
+    def _switch_focus(self, node):
+        """set_focus with a crossfade from what was on screen."""
+        self._stop_fade()
+        snapshot = self.grab()
+        self.set_focus(node)
+        self._start_fade(snapshot)
+
+
+    def _revalidate_groups(self):
+        """Selection and hover may point at a group that this frame did not
+        recreate (the tail starts at another index after a zoom). Move them
+        to the group now standing under the same parent, or drop them."""
+        for attr, signal in (("selected", self.selection_changed),
+                             ("hovered", None)):
+            node = getattr(self, attr)
+            if node is None or node.kind != "group":
+                continue
+            if any(b[1] is node for b in self._blocks):
+                continue
+            repl = next(
+                (b[1] for b in self._blocks
+                 if b[1].kind == "group" and b[1].parent is node.parent), None
+            )
+            setattr(self, attr, repl)
+            if signal is not None:
+                signal.emit(repl)
+
+
+    def _start_fade(self, snapshot):
+        self._fade = (snapshot, 1.0)
+
+        def step(t):
+            if self._fade is None or self._fade_anim is not fade:
+                return
+            self._fade = (snapshot, 1.0 - float(t))
+            if float(t) >= 1.0:
+                self._fade = None
+                self._fade_anim = None
+            self.update()
+
+        fade = QVariantAnimation(self)
+        fade.setDuration(FADE_MS)
+        fade.setStartValue(0.0)
+        fade.setEndValue(1.0)
+        fade.valueChanged.connect(step)
+        self._fade_anim = fade
+        fade.start(QVariantAnimation.DeleteWhenStopped)
+
+
+    def _stop_fade(self):
+        fade = self._fade_anim
+        self._fade_anim = None
+        self._fade = None
+        if fade is not None:
+            fade.stop()
+
+
+    def _child_hue(self, base_hue, i, n, depth):
+        """Hue for child `i` of `n` under a block of hue `base_hue`.
+
+        branches: direct children of the focus fan out over the wheel, deeper
+        levels inherit. rainbow: every level fans out again, starting at the
+        parent's hue so the largest child looks like its parent.
+        """
+        if self.scheme == "rainbow":
+            return (base_hue + i / max(1, n)) % 1.0
+        fan_depth = 1 if self.focus is not None and self.focus.kind == "disk" else 0
+        return (i / max(1, n)) if depth == fan_depth else base_hue
+
+
+    @staticmethod
+    def _is_top(node):
+        """Root of the scan (the disk wrapper does not count as a parent)."""
+        return node.parent is None or node.parent.kind == "disk"
+
+
+    def _focus_hue(self):
+        """Hue of the focus block: the colour it had as a child in its
+        parent's view, so drilling in keeps the left column recognisable.
+        rainbow derives it from the root chain; branches uses the position
+        among its siblings. Ignored for the top node, which is drawn grey."""
+        if self.focus is None:
+            return 0.0
+        if self.scheme == "branches":
+            if self._is_top(self.focus):
+                return 0.0
+            siblings = self.focus.parent.children
+            try:
+                return siblings.index(self.focus) / max(1, len(siblings))
+            except ValueError:
+                return 0.0
+        if self.scheme != "rainbow":
+            return 0.0
+        chain = []
+        node = self.focus
+        while node.parent is not None:
+            chain.append(node)
+            node = node.parent
+        hue = 0.0
+        for node in reversed(chain):
+            siblings = node.parent.children
+            try:
+                i = siblings.index(node)
+            except ValueError:   # synthetic group: no stable slot
+                i = 0
+            hue = (hue + i / max(1, len(siblings))) % 1.0
+        return hue
+
+
+    @staticmethod
+    def _abs_depth(node):
+        """Depth from the scanned root; the disk wrapper does not count."""
+        d = 0
+        while node.parent is not None and node.parent.kind != "disk":
+            d += 1
+            node = node.parent
+        return d
+
+
+    def _block_color(self, base_hue, depth, node=None, jitter=True):
+        if self.scheme == "levels":
+            if node is not None and node.kind == "disk":
+                return QColor("#a9a9a9")   # a frame around the volume, not a level
+            ad = self._abs_depth(node) if node is not None else depth
+            return QColor(SPACEMONGER_PALETTE[ad % len(SPACEMONGER_PALETTE)])
+        light = min(0.78, 0.42 + depth * 0.06)
+        if jitter and node is not None and depth > 0:
+            jitter = zlib.crc32(node.path.encode("utf-8", "surrogateescape"))
+            light += (jitter / 0xFFFFFFFF * 2 - 1) * SHADE_JITTER
+        if depth == 0:
+            # The focus column is a frame, not data: muted, and plain grey at
+            # the top where there is no parent view to echo.
+            sat = 0.0 if node is not None and self._is_top(node) else 0.22
+        else:
+            sat = 0.48
+        return QColor.fromHslF(base_hue % 1.0, sat, min(0.9, max(0.1, light)))
+
+
+    def _ink(self, bg):
+        """Cached per colour: a frame can ask for a thousand labels."""
+        key = bg.rgb()
+        ink = self._ink_cache.get(key)
+        if ink is None:
+            ink = self._ink_cache[key] = self._pick_ink(bg)
+        return ink
+
+    @staticmethod
+    def _pick_ink(bg):
+        """Label colours for a block: (name, size, halo), picked for contrast.
+
+        Most blocks are light, so white-on-light text used to lean entirely on
+        its outline to stay legible. Flipping the ink instead keeps the halo a
+        faint backing rather than something that thickens every glyph.
+        """
+        def lin(v):
+            return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+
+        lum = (0.2126 * lin(bg.redF()) + 0.7152 * lin(bg.greenF())
+               + 0.0722 * lin(bg.blueF()))
+        # 0.179 is where WCAG contrast against black and white is equal, so
+        # the pick is always at least 4.58:1 and the halo can stay faint. It
+        # only has to cover hovered blocks, which are drawn lighter.
+        if lum > 0.179:
+            return (QColor("#0a0a0a"), QColor("#2e2e2e"),
+                    QColor(255, 255, 255, HALO_ALPHA))
+        return QColor("#ffffff"), QColor("#e2e2e2"), QColor(0, 0, 0, HALO_ALPHA)
+
+
+    @staticmethod
+    def _draw_label(p, rect, flags, text, fg, halo):
+        """Draw a label; with a halo colour, back it with a 1px outline first.
+
+        The ink is picked for contrast against the block's own colour, so the
+        halo is only needed where that colour is not what is on screen: the
+        hovered block, drawn lighter. Five drawText calls per label instead of
+        one were a measurable share of a frame."""
+        if halo is not None:
+            p.setPen(halo)
+            for dx, dy in ((0, -1), (-1, 0), (1, 0), (0, 1)):
+                p.drawText(rect.translated(dx, dy), flags, text)
+        p.setPen(fg)
+        p.drawText(rect, flags, text)
+
+
+    def _draw_progress(self, p):
+        path, entries, target, current, secs = self.progress
+        fm = QFontMetrics(self.font())
+        lh = fm.height()
+        pad = 18
+        pw = min(560, max(320, self.width() - 2 * pad))
+        btn_h = self._cancel_btn.sizeHint().height()
+        ph = pad * 2 + lh * 3 + 30 + btn_h + 10
+        panel = QRectF((self.width() - pw) / 2, (self.height() - ph) / 2, pw, ph)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        shape = QPainterPath()
+        shape.addRoundedRect(panel, 8, 8)
+        p.fillPath(shape, QColor("#2b2d31"))
+        p.setPen(QPen(QColor("#4a4d55"), 1))
+        p.drawPath(shape)
+
+        inner = panel.adjusted(pad, pad, -pad, -pad)
+        x, y, w = inner.left(), inner.top(), inner.width()
+        p.setPen(QColor("#f0f0f0"))
+        title = fm.elidedText(f"Scanning {path}", Qt.ElideMiddle, int(w))
+        p.drawText(QRectF(x, y, w, lh), Qt.AlignLeft | Qt.AlignVCenter, title)
+        y += lh + 6
+
+        bar = QRectF(x, y, w, 10)
+        track = QPainterPath()
+        track.addRoundedRect(bar, 5, 5)
+        p.fillPath(track, QColor("#1a1b1e"))
+        p.setClipPath(track)
+        if target:
+            frac = min(0.995, entries / target)
+            p.fillRect(QRectF(x, y, w * frac, 10), QColor("#5aa9e6"))
+            status = f"{entries:,} of ~{target:,} entries  ({frac * 100:.0f}%)"
+        else:
+            # No target: a sweeping band driven by elapsed time so it moves
+            # even while du is slow to produce the next lines.
+            span = w * 0.3
+            pos = (secs * 0.5) % 1.0 * (w + span) - span
+            p.fillRect(QRectF(x + pos, y, span, 10), QColor("#5aa9e6"))
+            status = f"{entries:,} entries"
+        p.setClipping(False)
+        y += 10 + 8
+
+        p.setPen(QColor("#c8c8c8"))
+        p.drawText(QRectF(x, y, w, lh), Qt.AlignLeft | Qt.AlignVCenter,
+                   f"{status}    {secs:.0f}s")
+        y += lh + 2
+        p.setPen(QColor("#8a8f98"))
+        cur = fm.elidedText(current or "", Qt.ElideMiddle, int(w))
+        p.drawText(QRectF(x, y, w, lh), Qt.AlignLeft | Qt.AlignVCenter, cur)
+        p.setRenderHint(QPainter.Antialiasing, False)
+        btn = self._cancel_btn
+        bw = btn.sizeHint().width()
+        btn.setGeometry(int(inner.right() - bw), int(inner.bottom() - btn_h), bw, btn_h)
+        if not btn.isVisible():
+            btn.show()
+
+
+    # --- hit testing / interaction ---------------------------------------
+    def _node_at(self, pos):
+        for rect, node, _hue, _depth in reversed(self._blocks):
+            if rect.contains(pos):
+                return node
+        return None
+
+
+    def mouseMoveEvent(self, event):
+        if self._press_pos is not None and event.buttons() & (
+            Qt.LeftButton | Qt.MiddleButton
+        ):
+            d = event.position() - self._press_pos
+            if not self._dragging and abs(d.x()) + abs(d.y()) > DRAG_THRESHOLD:
+                self._dragging = True
+                self.setCursor(Qt.ClosedHandCursor)
+            if self._dragging:
+                self.pan_x = self._drag_origin[0] + d.x()
+                self.pan_y = self._drag_origin[1] + d.y()
+                self._clamp_pan()
+                self.update()
+                return
+        node = self._node_at(event.position())
+        if node is not self.hovered:
+            self.hovered = node
+            if node is not None:
+                self.setToolTip(f"{node.name if node.synthetic else node.path}"
+                                f"\n{human(node.size)}")
+            else:
+                self.setToolTip("")
+            self.update()
+
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            node = self._node_at(event.position())
+            if node is not None:
+                self._context_menu(node, event.globalPosition().toPoint())
+            return
+        if event.button() in (Qt.LeftButton, Qt.MiddleButton):
+            self._stop_anim()
+            self._press_pos = event.position()
+            self._drag_origin = (self.pan_x, self.pan_y)
+            self._dragging = False
+
+
+    def mouseReleaseEvent(self, event):
+        was_drag = self._dragging
+        self._press_pos = None
+        self._drag_origin = None
+        self._dragging = False
+        self.unsetCursor()
+        if not was_drag and event.button() == Qt.LeftButton:
+            self.set_selected(self._node_at(event.position()))
+
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        node = self._node_at(event.position())
+        if node is None:
+            return
+        if node is self.focus:
+            self.go_up()
+        elif node.children:
+            self.navigate(node)
+
+
+    def _context_menu(self, node, global_pos):
+        if node.kind == "disk":
+            node = next((c for c in node.children if c.kind is None), node)
+        if node.synthetic:
+            return
+        menu = QMenu(self)
+        folder = node.path if node.children else os.path.dirname(node.path)
+        act_open = QAction("Open in file manager", self)
+        act_open.triggered.connect(lambda: _open_folder(folder))
+        act_copy = QAction("Copy path", self)
+        act_copy.triggered.connect(
+            lambda: QGuiApplication.clipboard().setText(node.path)
+        )
+        menu.addAction(act_open)
+        menu.addAction(act_copy)
+        menu.exec(global_pos)
+
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if key == Qt.Key_Escape and self.progress is not None:
+            self.cancel_requested.emit()
+        elif key in (Qt.Key_Backspace, Qt.Key_Escape):
+            self.go_up()
+        elif key in (Qt.Key_0, Qt.Key_Home):
+            self.fit_view(animate=True)
+        elif key in (Qt.Key_Plus, Qt.Key_Equal, Qt.Key_Minus):
+            center = QPointF(self.width() / 2.0, self.height() / 2.0)
+            f = 1.0 / KEY_ZOOM_STEP if key == Qt.Key_Minus else KEY_ZOOM_STEP
+            self.zoom_step(center, f)
+        else:
+            super().keyPressEvent(event)
+
+
+class IcicleWidget(TreeView):
+    """Icicle view: horizontal columns, one per depth, sized by bytes."""
+
+    def __init__(self):
+        super().__init__()
+        # Viewport. Layout happens in a logical space where the focus node is
+        # LOGICAL_H tall and one column is LOGICAL_COLW wide; zx/zy/pan map it
+        # to pixels. Blocks are laid out in screen pixels directly, so zooming
+        # in subdivides deeper levels instead of just magnifying the same ones.
+        self.zy = 0.0                # 0 until the first fit
+        self.hx = 1.0                # horizontal offset on top of the damped zy
+        self._max_depth = 1          # deepest column last frame, for pan limits
+        self._more_right = False     # tree continues past the right edge
+        self._last_h = 0             # widget height at the last layout
+
+
     # --- viewport ---------------------------------------------------------
     def _fit_zy(self):
         return max(1e-9, self.height() / LOGICAL_H)
 
+
     def _fit_zx(self):
         return max(COL_MIN, min(COL_MAX, self.width() / 7.0)) / LOGICAL_COLW
+
 
     def _raw_zx(self):
         return (
             self._fit_zx() * (self.zy / self._fit_zy()) ** H_ZOOM_DAMPING * self.hx
         )
 
+
     @property
     def zx(self):
         return max(
             COLW_MIN_PX / LOGICAL_COLW, min(COLW_MAX_PX / LOGICAL_COLW, self._raw_zx())
         )
+
 
     def fit_view(self, redraw=True, animate=False):
         """Reset the viewport so the focus node fills the widget."""
@@ -578,14 +1122,10 @@ class IcicleWidget(QWidget):
         if redraw:
             self.update()
 
-    def _stop_anim(self):
-        anim = self._anim
-        if anim is not None:
-            self._anim = None
-            anim.stop()
 
     def _animate_to_fit(self, on_done=None):
         self._animate_view(self._fit_zy(), 1.0, 0.0, 0.0, on_done)
+
 
     def _animate_view(self, zy1, hx1, pan_x1, pan_y1, on_done=None):
         """Ease from the current viewport to the given one.
@@ -639,6 +1179,7 @@ class IcicleWidget(QWidget):
         self._anim = anim
         anim.start(QVariantAnimation.DeleteWhenStopped)
 
+
     # --- animated navigation ----------------------------------------------
     def navigate(self, node):
         """Change focus with a zoom animation instead of a jump.
@@ -647,7 +1188,7 @@ class IcicleWidget(QWidget):
         widget, then switches focus; going up switches first and starts from
         the viewport in which the old focus fills the widget, then eases to
         the fit. The switch itself changes colours (the focus column is
-        muted, classic re-fans hues), which a short crossfade covers.
+        muted, branches re-fans hues), which a short crossfade covers.
         """
         if node is None or node is self.focus or self.focus is None:
             return
@@ -684,12 +1225,6 @@ class IcicleWidget(QWidget):
         self.pan_x = pan_x_o - depth * zx_o * LOGICAL_COLW
         self._animate_to_fit()
 
-    def _switch_focus(self, node):
-        """set_focus with a crossfade from what was on screen."""
-        self._stop_fade()
-        snapshot = self.grab()
-        self.set_focus(node)
-        self._start_fade(snapshot)
 
     @staticmethod
     def _place_within(node, ancestor):
@@ -716,51 +1251,6 @@ class IcicleWidget(QWidget):
             height *= child.size / total
         return top, height, len(chain)
 
-    def _revalidate_groups(self):
-        """Selection and hover may point at a group that this frame did not
-        recreate (the tail starts at another index after a zoom). Move them
-        to the group now standing under the same parent, or drop them."""
-        for attr, signal in (("selected", self.selection_changed),
-                             ("hovered", None)):
-            node = getattr(self, attr)
-            if node is None or node.kind != "group":
-                continue
-            if any(b[1] is node for b in self._blocks):
-                continue
-            repl = next(
-                (b[1] for b in self._blocks
-                 if b[1].kind == "group" and b[1].parent is node.parent), None
-            )
-            setattr(self, attr, repl)
-            if signal is not None:
-                signal.emit(repl)
-
-    def _start_fade(self, snapshot):
-        self._fade = (snapshot, 1.0)
-
-        def step(t):
-            if self._fade is None or self._fade_anim is not fade:
-                return
-            self._fade = (snapshot, 1.0 - float(t))
-            if float(t) >= 1.0:
-                self._fade = None
-                self._fade_anim = None
-            self.update()
-
-        fade = QVariantAnimation(self)
-        fade.setDuration(FADE_MS)
-        fade.setStartValue(0.0)
-        fade.setEndValue(1.0)
-        fade.valueChanged.connect(step)
-        self._fade_anim = fade
-        fade.start(QVariantAnimation.DeleteWhenStopped)
-
-    def _stop_fade(self):
-        fade = self._fade_anim
-        self._fade_anim = None
-        self._fade = None
-        if fade is not None:
-            fade.stop()
 
     def _zoom_in_limit(self):
         """How far past the fit zoom it is still useful to go, as a factor."""
@@ -768,26 +1258,25 @@ class IcicleWidget(QWidget):
             return ZOOM_IN_CAP
         return max(4.0, min(ZOOM_IN_CAP, self.focus.size / ZOOM_IN_UNIT))
 
+
     def _clamp_zoom(self):
         fz = self._fit_zy()
         self.zy = max(fz * ZOOM_OUT_LIMIT, min(fz * self._zoom_in_limit(), self.zy))
 
-    def _clamp_pan(self):
-        """Keep half the content in view, or half a screen of it if it is taller.
 
-        The bound has to be continuous in the zoom level: an "if it fits, show
-        all of it" rule collapses the allowed range the moment the content
-        shrinks below the widget, and the view snaps on that wheel notch.
-        """
+    def _clamp_pan(self):
+        """No empty margins: content larger than the widget can be panned
+        until its far edge meets the widget's; smaller content stays put at
+        the top/left. Continuous in the zoom level (both bounds are 0 where
+        the content just fits), so nothing snaps on a wheel notch."""
         w, h = float(self.width()), float(self.height())
         total_h = LOGICAL_H * self.zy
-        keep = min(h, total_h) / 2
-        self.pan_y = min(h - keep, max(keep - total_h, self.pan_y))
+        self.pan_y = min(0.0, max(min(0.0, h - total_h), self.pan_y))
         total_w = max(1, self._max_depth) * LOGICAL_COLW * self.zx
         if self._more_right:
             total_w += w
-        keep = min(w, total_w) / 2
-        self.pan_x = min(w - keep, max(keep - total_w, self.pan_x))
+        self.pan_x = min(0.0, max(min(0.0, w - total_w), self.pan_x))
+
 
     def _zoom_at(self, pos, fy, fh=1.0):
         """Scale about `pos`, keeping whatever is under the cursor in place.
@@ -812,6 +1301,10 @@ class IcicleWidget(QWidget):
         self._clamp_pan()
         self.update()
 
+
+    def zoom_step(self, pos, factor):
+        self._zoom_at(pos, factor)
+
     def wheelEvent(self, event):
         self._stop_anim()
         dy = event.angleDelta().y()
@@ -830,6 +1323,7 @@ class IcicleWidget(QWidget):
             fy, fh = factor, 1.0
         self._zoom_at(event.position(), fy, fh)
         event.accept()
+
 
     # --- layout -----------------------------------------------------------
     def _layout(self, node, x, y, h, depth, base_hue, colw, in_group):
@@ -901,126 +1395,9 @@ class IcicleWidget(QWidget):
             group_hue = self._child_hue(base_hue, i, n, depth)
             self._blocks.append((grect, group, group_hue, depth + 1))
 
-    def _child_hue(self, base_hue, i, n, depth):
-        """Hue for child `i` of `n` under a block of hue `base_hue`.
-
-        classic: direct children of the focus fan out over the wheel, deeper
-        levels inherit. rainbow: every level fans out again, starting at the
-        parent's hue so the largest child looks like its parent.
-        """
-        if self.scheme == "rainbow":
-            return (base_hue + i / max(1, n)) % 1.0
-        fan_depth = 1 if self.focus is not None and self.focus.kind == "disk" else 0
-        return (i / max(1, n)) if depth == fan_depth else base_hue
-
-    @staticmethod
-    def _is_top(node):
-        """Root of the scan (the disk wrapper does not count as a parent)."""
-        return node.parent is None or node.parent.kind == "disk"
-
-    def _focus_hue(self):
-        """Hue of the focus block: the colour it had as a child in its
-        parent's view, so drilling in keeps the left column recognisable.
-        rainbow derives it from the root chain; classic uses the position
-        among its siblings. Ignored for the top node, which is drawn grey."""
-        if self.focus is None:
-            return 0.0
-        if self.scheme == "classic":
-            if self._is_top(self.focus):
-                return 0.0
-            siblings = self.focus.parent.children
-            try:
-                return siblings.index(self.focus) / max(1, len(siblings))
-            except ValueError:
-                return 0.0
-        if self.scheme != "rainbow":
-            return 0.0
-        chain = []
-        node = self.focus
-        while node.parent is not None:
-            chain.append(node)
-            node = node.parent
-        hue = 0.0
-        for node in reversed(chain):
-            siblings = node.parent.children
-            try:
-                i = siblings.index(node)
-            except ValueError:   # synthetic group: no stable slot
-                i = 0
-            hue = (hue + i / max(1, len(siblings))) % 1.0
-        return hue
-
-    @staticmethod
-    def _abs_depth(node):
-        """Depth from the scanned root; the disk wrapper does not count."""
-        d = 0
-        while node.parent is not None and node.parent.kind != "disk":
-            d += 1
-            node = node.parent
-        return d
-
-    def _block_color(self, base_hue, depth, node=None, jitter=True):
-        if self.scheme == "spacemonger":
-            if node is not None and node.kind == "disk":
-                return QColor("#a9a9a9")   # a frame around the volume, not a level
-            ad = self._abs_depth(node) if node is not None else depth
-            return QColor(SPACEMONGER_PALETTE[ad % len(SPACEMONGER_PALETTE)])
-        light = min(0.78, 0.42 + depth * 0.06)
-        if jitter and node is not None and depth > 0:
-            jitter = zlib.crc32(node.path.encode("utf-8", "surrogateescape"))
-            light += (jitter / 0xFFFFFFFF * 2 - 1) * SHADE_JITTER
-        if depth == 0:
-            # The focus column is a frame, not data: muted, and plain grey at
-            # the top where there is no parent view to echo.
-            sat = 0.0 if node is not None and self._is_top(node) else 0.22
-        else:
-            sat = 0.48
-        return QColor.fromHslF(base_hue % 1.0, sat, min(0.9, max(0.1, light)))
-
-    @staticmethod
-    def _ink(bg):
-        """Label colours for a block: (name, size, halo), picked for contrast.
-
-        Most blocks are light, so white-on-light text used to lean entirely on
-        its outline to stay legible. Flipping the ink instead keeps the halo a
-        faint backing rather than something that thickens every glyph.
-        """
-        def lin(v):
-            return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
-
-        lum = (0.2126 * lin(bg.redF()) + 0.7152 * lin(bg.greenF())
-               + 0.0722 * lin(bg.blueF()))
-        # 0.179 is where WCAG contrast against black and white is equal, so
-        # the pick is always at least 4.58:1 and the halo can stay faint. It
-        # only has to cover hovered blocks, which are drawn lighter.
-        if lum > 0.179:
-            return (QColor("#0a0a0a"), QColor("#2e2e2e"),
-                    QColor(255, 255, 255, HALO_ALPHA))
-        return QColor("#ffffff"), QColor("#e2e2e2"), QColor(0, 0, 0, HALO_ALPHA)
-
-    @staticmethod
-    def _draw_label(p, rect, flags, text, fg, halo):
-        """Back the text with a 1px halo; a heavier outline eats into the font."""
-        p.setPen(halo)
-        for dx, dy in ((0, -1), (-1, 0), (1, 0), (0, 1)):
-            p.drawText(rect.translated(dx, dy), flags, text)
-        p.setPen(fg)
-        p.drawText(rect, flags, text)
 
     # --- painting ---------------------------------------------------------
-    def paintEvent(self, _event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, False)
-        p.fillRect(self.rect(), QColor("#1e1f22"))
-
-        if self.focus is None:
-            if self.progress is None:
-                p.setPen(QColor("#888"))
-                p.drawText(self.rect(), Qt.AlignCenter, self.empty_text)
-            else:
-                self._draw_progress(p)
-            return
-
+    def _paint_content(self, p):
         if self.zy <= 0:
             self.fit_view(redraw=False)
         elif self._last_h and self._last_h != self.height():
@@ -1057,7 +1434,6 @@ class IcicleWidget(QWidget):
         outlines = []
         labels = []          # (vis rect, node, base colour, ink, ink_size, halo)
         selected_rect = None
-        hatch = QBrush(QColor(0, 0, 0, 80), Qt.BDiagPattern)
         for rect, node, base_hue, depth in self._blocks:
             # A zoomed-in block can be millions of pixels tall; clip it to the
             # viewport so both the fill and its labels stay on screen.
@@ -1065,50 +1441,24 @@ class IcicleWidget(QWidget):
             if vis.width() < 1 or vis.height() < 1:
                 continue
             hovered = node is self.hovered
-            if node.kind == "group":
-                base = self._group_color(base_hue, depth, node)
-            elif node.kind == "free":
-                base = QColor(
-                    "#e6e6e6" if self.scheme == "spacemonger" else "#3a3d42"
-                )
-            else:
-                base = self._block_color(base_hue, depth, node)
+            base = self._base_color(node, base_hue, depth)
             color = base.lighter(118 if node.is_group else 122) if hovered else base
-            if self.bevel:
-                grad = QLinearGradient(vis.topLeft(), vis.bottomLeft())
-                grad.setColorAt(0.0, color.lighter(107))
-                grad.setColorAt(1.0, color.darker(109))
-                p.fillRect(vis, grad)
-            else:
-                p.fillRect(vis, color)
+            self._fill_block(p, vis, color)
             if node.is_group:
-                p.fillRect(vis, hatch)   # texture marks it as grouped
+                p.fillRect(vis, _stipple())   # texture marks it as grouped
             outlines.append(vis)
             if node is self.selected:
                 selected_rect = vis
             if vis.height() >= fm.height() + 3 and vis.width() > 34:
                 # Ink comes from the unhovered colour so it cannot flip on
                 # hover; only labelled blocks need it computed at all.
-                labels.append((vis, node, base) + self._ink(base))
+                ink, ink_size, halo = self._ink(base)
+                labels.append((vis, node, base, ink, ink_size,
+                               halo if hovered else None))
 
-        # Edges as 1px fill strips: stroking a rect through the raster engine
-        # cost more than the whole rest of the frame once the layout itself
-        # got cheap, and fillRect is an order of magnitude faster.
-        if self.bevel:
-            light, dark = QColor(255, 255, 255, 85), QColor(0, 0, 0, 115)
-        else:
-            light = dark = QColor(0, 0, 0, 60)
-        for r in outlines:
-            x0, y0, x1, y1 = r.left(), r.top(), r.right(), r.bottom()
-            p.fillRect(QRectF(x0, y0, x1 - x0, 1), light)
-            p.fillRect(QRectF(x0, y0, 1, y1 - y0), light)
-            p.fillRect(QRectF(x0, y1 - 1, x1 - x0, 1), dark)
-            p.fillRect(QRectF(x1 - 1, y0, 1, y1 - y0), dark)
+        self._draw_edges(p, outlines)
         if selected_rect is not None:
-            pen = QPen(QColor("#ffffff"))
-            pen.setWidth(2)
-            p.setPen(pen)
-            p.drawRect(selected_rect.adjusted(1, 1, -1, -1))
+            self._draw_selection(p, selected_rect)
 
         for vis, node, base, ink, ink_size, halo in labels:
             inner = vis.adjusted(6, 2, -6, -2)
@@ -1118,7 +1468,7 @@ class IcicleWidget(QWidget):
                 label = "▸ " + label
             name = fm.elidedText(label, Qt.ElideMiddle, int(inner.width()))
             if node.is_group:
-                # Text over the hatching, lighter still on hover, was barely
+                # Text over the stipple, lighter still on hover, was barely
                 # legible: give each label line a solid backing in the
                 # group's own colour so the ink always sits on plain ground.
                 backing = QColor(base)
@@ -1140,163 +1490,631 @@ class IcicleWidget(QWidget):
                     p, inner, Qt.AlignLeft | Qt.AlignBottom,
                     human(node.size), ink_size, halo,
                 )
-        if self._fade is not None:
-            snapshot, opacity = self._fade
-            p.setOpacity(opacity)
-            p.drawPixmap(0, 0, snapshot)
-            p.setOpacity(1.0)
-        if self.progress is not None:
-            # Rescan: keep the old tree visible but clearly stale.
-            p.fillRect(self.rect(), QColor(0, 0, 0, 120))
-            self._draw_progress(p)
-        p.end()
 
-    def _draw_progress(self, p):
-        path, entries, target, current, secs = self.progress
-        fm = QFontMetrics(self.font())
-        lh = fm.height()
-        pad = 18
-        pw = min(560, max(320, self.width() - 2 * pad))
-        ph = pad * 2 + lh * 3 + 30
-        panel = QRectF((self.width() - pw) / 2, (self.height() - ph) / 2, pw, ph)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        shape = QPainterPath()
-        shape.addRoundedRect(panel, 8, 8)
-        p.fillPath(shape, QColor("#2b2d31"))
-        p.setPen(QPen(QColor("#4a4d55"), 1))
-        p.drawPath(shape)
+class Squarifier:
+    """Incremental squarified treemap (Bruls, Huizing, van Wijk) of a
+    directory's children, sorted descending, into a box of the given aspect
+    ratio (normalised: width = aspect, height = 1).
 
-        inner = panel.adjusted(pad, pad, -pad, -pad)
-        x, y, w = inner.left(), inner.top(), inner.width()
-        p.setPen(QColor("#f0f0f0"))
-        hint = "Esc cancels"
-        hint_w = fm.horizontalAdvance(hint) + 16
-        title = fm.elidedText(f"Scanning {path}", Qt.ElideMiddle, int(w - hint_w))
-        p.drawText(QRectF(x, y, w, lh), Qt.AlignLeft | Qt.AlignVCenter, title)
-        p.setPen(QColor("#8a8f98"))
-        p.drawText(QRectF(x, y, w, lh), Qt.AlignRight | Qt.AlignVCenter, hint)
-        y += lh + 6
+    Rows are laid out along the shorter side of what is left, adding items
+    while the worst aspect ratio in the row keeps improving. A finished row
+    never changes when later rows are added, so the layout can stop at the
+    first item too small to draw and be extended when a deeper zoom needs
+    more, with everything already placed staying put. Memory follows what is
+    on screen, not the size of the directory."""
+    __slots__ = ("children", "scale", "aspect", "x", "y", "w", "h", "i", "idx", "geo",
+                 "rows", "rowgeo")
 
-        bar = QRectF(x, y, w, 10)
-        track = QPainterPath()
-        track.addRoundedRect(bar, 5, 5)
-        p.fillPath(track, QColor("#1a1b1e"))
-        p.setClipPath(track)
-        if target:
-            frac = min(0.995, entries / target)
-            p.fillRect(QRectF(x, y, w * frac, 10), QColor("#5aa9e6"))
-            status = f"{entries:,} of ~{target:,} entries  ({frac * 100:.0f}%)"
-        else:
-            # No target: a sweeping band driven by elapsed time so it moves
-            # even while du is slow to produce the next lines.
-            span = w * 0.3
-            pos = (secs * 0.5) % 1.0 * (w + span) - span
-            p.fillRect(QRectF(x + pos, y, span, 10), QColor("#5aa9e6"))
-            status = f"{entries:,} entries"
-        p.setClipping(False)
-        y += 10 + 8
+    def __init__(self, children, total, aspect):
+        self.children = children
+        self.scale = aspect / float(total or 1)      # normalised area per byte
+        self.aspect = aspect
+        self.x = self.y = 0.0
+        self.w, self.h = aspect, 1.0
+        self.i = 0
+        # Compact: a child index and four fractions (x, y, w, h of the box)
+        # per entry, 36 bytes instead of a 200-byte tuple; a 190k-entry
+        # directory then costs 7 MB, not 40.
+        self.idx = array.array("I")
+        self.geo = array.array("d")
+        # Row strips: first entry index and x, y, w, h of each row, so the
+        # layout loop can skip a whole off-screen row at once.
+        self.rows = array.array("I")
+        self.rowgeo = array.array("d")
 
-        p.setPen(QColor("#c8c8c8"))
-        p.drawText(QRectF(x, y, w, lh), Qt.AlignLeft | Qt.AlignVCenter,
-                   f"{status}    {secs:.0f}s")
-        y += lh + 2
-        p.setPen(QColor("#8a8f98"))
-        cur = fm.elidedText(current or "", Qt.ElideMiddle, int(w))
-        p.drawText(QRectF(x, y, w, lh), Qt.AlignLeft | Qt.AlignVCenter, cur)
-        p.setRenderHint(QPainter.Antialiasing, False)
+    def __len__(self):
+        return len(self.idx)
 
-    # --- hit testing / interaction ---------------------------------------
-    def _node_at(self, pos):
-        for rect, node, _hue, _depth in self._blocks:
-            if rect.contains(pos):
-                return node
-        return None
+    def extend(self, min_area):
+        """Lay out further rows until the next item is below `min_area`
+        (normalised units) or the children run out."""
+        children, scale, aspect = self.children, self.scale, self.aspect
+        n = len(children)
+        x, y, w, h, i = self.x, self.y, self.w, self.h, self.i
+        idx, geo, rows, rowgeo = self.idx, self.geo, self.rows, self.rowgeo
+        while i < n and children[i].size * scale >= min_area:
+            side = min(w, h)
+            if side <= 1e-12:
+                i = n
+                break
+            row_sum = row_max = row_min = children[i].size * scale
+            j = i + 1
+            side2 = side * side
 
-    def mouseMoveEvent(self, event):
-        if self._press_pos is not None and event.buttons() & (
-            Qt.LeftButton | Qt.MiddleButton
-        ):
-            d = event.position() - self._press_pos
-            if not self._dragging and abs(d.x()) + abs(d.y()) > DRAG_THRESHOLD:
-                self._dragging = True
-                self.setCursor(Qt.ClosedHandCursor)
-            if self._dragging:
-                self.pan_x = self._drag_origin[0] + d.x()
-                self.pan_y = self._drag_origin[1] + d.y()
-                self._clamp_pan()
-                self.update()
-                return
-        node = self._node_at(event.position())
-        if node is not self.hovered:
-            self.hovered = node
-            if node is not None:
-                self.setToolTip(f"{node.name if node.synthetic else node.path}"
-                                f"\n{human(node.size)}")
-            else:
-                self.setToolTip("")
+            def worst(s, mx, mn):
+                return max(side2 * mx / (s * s), s * s / (side2 * mn)) if mn > 0 else float("inf")
+
+            best = worst(row_sum, row_max, row_min)
+            while j < n:
+                a = children[j].size * scale
+                s2 = row_sum + a
+                w2 = worst(s2, row_max, min(row_min, a))
+                if w2 > best:
+                    break
+                row_sum, row_min, best = s2, min(row_min, a), w2
+                j += 1
+            thick = row_sum / side
+            rows.append(len(idx))
+            if w >= h:      # vertical strip on the left
+                rowgeo.extend((x / aspect, y, thick / aspect, h))
+                cy = y
+                for k in range(i, j):
+                    ch = children[k].size * scale / thick
+                    if ch > 0:
+                        idx.append(k)
+                        geo.extend((x / aspect, cy, thick / aspect, ch))
+                    cy += ch
+                x += thick
+                w -= thick
+            else:           # horizontal strip on top
+                rowgeo.extend((x / aspect, y, w / aspect, thick))
+                cx = x
+                for k in range(i, j):
+                    cw = children[k].size * scale / thick
+                    if cw > 0:
+                        idx.append(k)
+                        geo.extend((cx / aspect, y, cw / aspect, thick))
+                    cx += cw
+                y += thick
+                h -= thick
+            i = j
+        self.x, self.y, self.w, self.h, self.i = x, y, w, h, i
+
+
+class BoxesWidget(TreeView):
+    """SpaceMonger-style view: the focus is a box filling the widget, every
+    directory inside it a titled box with its children packed inside by a
+    squarified treemap, recursively while there is room."""
+
+    def __init__(self):
+        super().__init__()
+        self.s = 0.0                 # uniform scale, 1.0 = fit; 0 until the first fit
+        self._info = []              # per block: title bar height (0 = none)
+        # Layouts are decided once per directory in normalised coordinates
+        # and only scaled afterwards, so zooming never rearranges anything;
+        # the screen size decides what is drawn, not where it goes.
+        self._layouts = {}           # id(dir) -> Squarifier (laid out as far as needed)
+        self._layout_entries = 0
+
+    def set_root(self, root):
+        self._layouts = {}
+        self._layout_entries = 0
+        super().set_root(root)
+
+    def set_focus(self, node):
+        self._layouts = {}           # boxes take the aspect they get under this focus
+        self._layout_entries = 0
+        super().set_focus(node)
+
+    def resizeEvent(self, event):
+        self._layouts = {}
+        self._layout_entries = 0
+        super().resizeEvent(event)
+
+    # --- viewport ---------------------------------------------------------
+    def fit_view(self, redraw=True, animate=False):
+        self._stop_anim()
+        if animate and self.s > 0 and self.focus is not None:
+            self._animate_view(1.0, 0.0, 0.0)
+            return
+        self.s = 1.0
+        self.pan_x = self.pan_y = 0.0
+        if redraw:
             self.update()
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.RightButton:
-            node = self._node_at(event.position())
-            if node is not None:
-                self._context_menu(node, event.globalPosition().toPoint())
+    def _zoom_in_limit(self):
+        if self.focus is None or self.focus.size <= 0:
+            return ZOOM_IN_CAP
+        return max(4.0, min(ZOOM_IN_CAP, self.focus.size / ZOOM_IN_UNIT))
+
+    def _clamp_pan(self):
+        """The focus box always covers the widget (zoom-out stops at the fit)."""
+        w, h = float(self.width()), float(self.height())
+        for attr, extent, span in (("pan_x", w * self.s, w), ("pan_y", h * self.s, h)):
+            setattr(self, attr, min(0.0, max(span - extent, getattr(self, attr))))
+
+    def _zoom_at(self, pos, factor):
+        if self.s <= 0:
+            self.fit_view(redraw=False)
+        old = self.s
+        self.s = max(BOX_ZOOM_OUT_LIMIT, min(self._zoom_in_limit(), self.s * factor))
+        k = self.s / old
+        self.pan_x = pos.x() - (pos.x() - self.pan_x) * k
+        self.pan_y = pos.y() - (pos.y() - self.pan_y) * k
+        self._clamp_pan()
+        self.update()
+
+    def zoom_step(self, pos, factor):
+        self._zoom_at(pos, factor)
+
+    def wheelEvent(self, event):
+        self._stop_anim()
+        dy = event.angleDelta().y()
+        if dy == 0:
+            dy = event.pixelDelta().y() * 3
+        if dy == 0:
             return
-        if event.button() in (Qt.LeftButton, Qt.MiddleButton):
-            self._stop_anim()
-            self._press_pos = event.position()
-            self._drag_origin = (self.pan_x, self.pan_y)
-            self._dragging = False
+        self._zoom_at(event.position(), ZOOM_STEP ** dy)
+        event.accept()
+
+    def _animate_view(self, s1, pan_x1, pan_y1, on_done=None):
+        """Geometric zoom interpolation anchored on the widget centre."""
+        w, h = self.width() / 2.0, self.height() / 2.0
+        s0 = self.s
+        start = (math.log(s0), (w - self.pan_x) / s0, (h - self.pan_y) / s0)
+        end = (math.log(s1), (w - pan_x1) / s1, (h - pan_y1) / s1)
+
+        def step(t):
+            if self._anim is not anim:
+                return
+            u = float(t)
+            ls, cx, cy = (a + (b - a) * u for a, b in zip(start, end))
+            self.s = math.exp(ls)
+            self.pan_x = w - cx * self.s
+            self.pan_y = h - cy * self.s
+            if u >= 1.0:
+                self.s = s1
+                self.pan_x, self.pan_y = pan_x1, pan_y1
+                if on_done is not None:
+                    on_done()
+                if self._anim is anim:
+                    self._anim = None
+            self.update()
+
+        anim = QVariantAnimation(self)
+        anim.setDuration(NAV_ANIM_MS if on_done is not None else FIT_ANIM_MS)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.InOutCubic if on_done else QEasingCurve.OutCubic)
+        anim.valueChanged.connect(step)
+        self._anim = anim
+        anim.start(QVariantAnimation.DeleteWhenStopped)
+
+    def _cover_view(self, rect):
+        """(s, pan_x, pan_y) that scales the current view so `rect` covers the
+        widget, centred. Cover rather than contain: a tall narrow box then
+        really zooms in instead of just sliding to the middle, and the fit
+        layout that follows re-packs its contents anyway."""
+        w, h = float(self.width()), float(self.height())
+        k = max(w / max(1.0, rect.width()), h / max(1.0, rect.height()))
+        s1 = self.s * k
+        cx, cy = rect.center().x(), rect.center().y()
+        return s1, w / 2 - (cx - self.pan_x) * k, h / 2 - (cy - self.pan_y) * k
+
+    def navigate(self, node):
+        if node is None or node is self.focus or self.focus is None:
+            return
+        if self.s <= 0 or not self.isVisible():
+            self.set_focus(node)
+            return
+        self._stop_anim()
+        block = next((b for b in self._blocks if b[1] is node), None)
+        if block is not None:
+            s1, px, py = self._cover_view(block[0])
+            self._animate_view(s1, px, py, on_done=lambda: self._switch_focus(node))
+            return
+        old = self.focus
+        self._switch_focus(node)
+        # Where does the old focus sit in the new focus's fit layout? Start
+        # the view zoomed onto it and ease out to the fit.
+        blocks, info = self._blocks, self._info
+        self._blocks, self._info = [], []
+        self._th, self._view = self._title_height(), QRectF(self.rect())
+        self._floor_area = max(MIN_BOX_PX * MIN_BOX_PX,
+                               self.width() * self.height() / BOX_BUDGET)
+        self._layout_box(node, QRectF(0, 0, self.width(), self.height()), 0,
+                         self._focus_hue())
+        place = next((b[0] for b in self._blocks if b[1] is old), None)
+        self._blocks, self._info = blocks, info
+        if place is None:
+            return
+        self.s, self.pan_x, self.pan_y = self._cover_view(place)
+        self._animate_view(1.0, 0.0, 0.0)
+
+    # --- layout -----------------------------------------------------------
+    def _title_height(self):
+        return QFontMetrics(self.font()).height() + 2 * BOX_TITLE_PAD
+
+    def _revalidate_groups(self):
+        """Groups are permanent here (one per directory), so a selected one
+        that is off screen or below the size floor is still valid."""
+
+    def _dir_layout(self, node, rect, min_frac):
+        """Layout entries of a directory's children, laid out at least as far
+        as items covering `min_frac` of the box (the on-screen size floor).
+
+        Computed for the aspect the box has when first seen under the current
+        focus and then kept until the focus or the widget size changes. Title
+        bars and insets are fixed pixels, so a box's content aspect drifts as
+        you zoom; recomputing for it would reflow the children. Squarify sees
+        a slightly stale aspect instead, which costs a little squareness and
+        no stability. The cache is dropped wholesale past LAYOUT_BUDGET
+        entries; layouts are deterministic, so that changes nothing."""
+        sq = self._layouts.get(id(node))
+        if sq is None:
+            aspect = rect.width() / max(1e-9, rect.height())
+            sq = Squarifier(node.children, node.children_size, aspect)
+            if self._layout_entries > LAYOUT_BUDGET:
+                self._layouts = {}
+                self._layout_entries = 0
+            self._layouts[id(node)] = sq
+        before = len(sq)
+        sq.extend(min_frac * sq.aspect)
+        self._layout_entries += len(sq) - before
+        return sq
+
+    def _layout_box(self, node, rect, depth, hue):
+        if not rect.intersects(self._view):
+            return
+        th = self._th
+        open_children = bool(node.children)
+        titled = (open_children
+                  and rect.height() >= th + 2 * MIN_BOX_PX and rect.width() >= 40)
+        self._blocks.append((rect, node, hue, depth))
+        # Per block: title bar height, 0 for a leaf-like box (centred label),
+        # or -1 for an untitled box whose children fill it (no label at all,
+        # they would land on top of the children's).
+        info_idx = len(self._info)
+        self._info.append(th if titled else 0.0)
+        if not open_children:
+            return
+        top = th if titled else BOX_INSET
+        inner = QRectF(rect.x() + BOX_INSET, rect.y() + top,
+                       rect.width() - 2 * BOX_INSET, rect.height() - top - BOX_INSET)
+        if inner.width() < MIN_BOX_PX or inner.height() < MIN_BOX_PX:
+            return
+        ix, iy, iw, ih = inner.x(), inner.y(), inner.width(), inner.height()
+        floor_area = self._floor_area
+        layout = self._dir_layout(node, rect, floor_area / (iw * ih))
+        children = node.children
+        n = len(children)
+        laid = 0
+        vx0, vy0 = self._view.left(), self._view.top()
+        vx1, vy1 = self._view.right(), self._view.bottom()
+        idx, geo, rows, rowgeo = layout.idx, layout.geo, layout.rows, layout.rowgeo
+        total_entries = len(idx)
+        for r in range(len(rows)):
+            start = rows[r]
+            end = rows[r + 1] if r + 1 < len(rows) else total_entries
+            if start >= end:
+                continue
+            g = 4 * start
+            if geo[g + 2] * iw * geo[g + 3] * ih < floor_area:
+                break       # rows are sorted by size too: the rest is smaller
+            rg = 4 * r
+            rx, ry = ix + rowgeo[rg] * iw, iy + rowgeo[rg + 1] * ih
+            rw, rh = rowgeo[rg + 2] * iw, rowgeo[rg + 3] * ih
+            if rx > vx1 or ry > vy1 or rx + rw < vx0 or ry + rh < vy0:
+                continue    # whole row off screen
+            for k in range(start, end):
+                g = 4 * k
+                w, h = geo[g + 2] * iw, geo[g + 3] * ih
+                if w * h < floor_area:
+                    break
+                if w < 1 or h < 1:
+                    continue
+                x, y = ix + geo[g] * iw, iy + geo[g + 1] * ih
+                if x > vx1 or y > vy1 or x + w < vx0 or y + h < vy0:
+                    continue
+                j = idx[k]
+                self._layout_box(children[j], QRectF(x, y, w, h),
+                                 depth + 1, self._child_hue(hue, j, n, depth))
+                laid += 1
+        if laid and not titled:
+            self._info[info_idx] = -1.0
+
+    # --- painting ---------------------------------------------------------
+    def _paint_content(self, p):
+        if self.s <= 0:
+            self.fit_view(redraw=False)
+        w, h = float(self.width()), float(self.height())
+        self._th, self._view = self._title_height(), QRectF(self.rect())
+        self._floor_area = max(MIN_BOX_PX * MIN_BOX_PX, w * h / BOX_BUDGET)
+        for _attempt in range(2):
+            self._blocks, self._info = [], []
+            self._layout_box(
+                self.focus, QRectF(self.pan_x, self.pan_y, w * self.s, h * self.s),
+                0, self._focus_hue(),
+            )
+            if self._anim is not None:
+                break
+            pan = (self.pan_x, self.pan_y)
+            self._clamp_pan()
+            if (self.pan_x, self.pan_y) == pan:
+                break
+        self._revalidate_groups()
+
+        view = QRectF(self.rect())
+        fm = QFontMetrics(self.font())
+        lh = fm.height()
+        edges = []
+        wells = []           # content areas of open directories, drawn sunken
+        labels = []          # (vis, rect, node, title_h, base, ink, ink_size, halo)
+        selected_rect = None
+        # Anchor the dots to the content so they move with it when panning.
+        # Done on the brush itself: QPainter.setBrushOrigin would shift the
+        # gradients too, and a large pan then paints every block in its
+        # gradient's end colour.
+        stipple = QBrush(_stipple())
+        stipple.setTransform(QTransform.fromTranslate(self.pan_x % 6, self.pan_y % 6))
+        for (rect, node, hue, depth), th in zip(self._blocks, self._info):
+            vis = rect.intersected(view)
+            if vis.width() < 1 or vis.height() < 1:
+                continue
+            hovered = node is self.hovered
+            base = self._base_color(node, hue, depth)
+            color = base.lighter(118 if node.is_group else 112) if hovered else base
+            small = vis.width() < SMALL_BOX_PX or vis.height() < SMALL_BOX_PX
+            if node.is_group:
+                # Sunken, stippled, flat: the unresolved rest of the parent.
+                p.fillRect(vis, color)
+                p.fillRect(vis, stipple)
+                if not small:
+                    wells.append(vis)
+            elif small:
+                p.fillRect(vis, color)      # too small for relief to register
+            elif th != 0:
+                # A directory's body is covered by its children; a gradient
+                # over the whole box at every nesting level would repaint the
+                # screen area once per depth. Flat body, relief on the bar.
+                p.fillRect(vis, color)
+                if th > 0:
+                    bar = QRectF(rect.x(), rect.y(), rect.width(), th).intersected(view)
+                    if bar.height() >= 1:
+                        self._fill_block(p, bar, color)
+                edges.append(vis)
+            else:
+                self._fill_block(p, vis, color)
+                edges.append(vis)
+            if th != 0 and not small and not node.is_group:
+                top = th if th > 0 else BOX_INSET
+                well = QRectF(rect.x() + BOX_INSET - 1, rect.y() + top - 1,
+                              rect.width() - 2 * BOX_INSET + 2,
+                              rect.height() - top - BOX_INSET + 2).intersected(view)
+                if well.width() > 2 and well.height() > 2:
+                    wells.append(well)
+                    # Whatever the children do not cover is content too small
+                    # to lay out: show it as stipple, SpaceMonger 2 style.
+                    p.fillRect(well.adjusted(1, 1, -1, -1), stipple)
+            if node is self.selected:
+                selected_rect = vis
+            if th > 0 or (th == 0 and vis.height() >= lh + 4 and vis.width() >= 40):
+                ink, ink_size, halo = self._ink(base)
+                labels.append((vis, rect, node, th, base, ink, ink_size,
+                               halo if hovered else None))
+        self._draw_edges(p, edges)
+        # Sunken frame around each directory's content area: parent/child
+        # boundaries then read dark-then-light exactly like the boundary
+        # between two sibling boxes, instead of a lone light line.
+        self._draw_edges(p, wells, sunken=True)
+        if selected_rect is not None:
+            self._draw_selection(p, selected_rect)
+
+        for vis, rect, node, th, base, ink, ink_size, halo in labels:
+            name = node.name
+            if th > 0:
+                # Title bar: name left, size right when both fit. The bar
+                # scrolls with the box but is clipped to the visible part.
+                bar = QRectF(rect.x(), rect.y(), rect.width(), th).intersected(view)
+                if bar.height() < lh:
+                    continue
+                inner = bar.adjusted(BOX_INSET + 2, 0, -(BOX_INSET + 2), 0)
+                size_txt = human(node.size)
+                size_w = fm.horizontalAdvance(size_txt)
+                name_room = inner.width()
+                show_size = inner.width() > size_w + 60
+                if show_size:
+                    name_room -= size_w + 12
+                text = self._fit_name(fm, node, name, name_room)
+                self._draw_label(p, inner, Qt.AlignLeft | Qt.AlignVCenter, text, ink, halo)
+                if show_size:
+                    self._draw_label(p, inner, Qt.AlignRight | Qt.AlignVCenter,
+                                     size_txt, ink_size, halo)
+            else:
+                # Leaf (or a directory too small to open): centred labels.
+                inner = vis.adjusted(4, 2, -4, -2)
+                text = self._fit_name(fm, node, name, inner.width())
+                two = inner.height() >= 2 * lh + 2
+                if two:
+                    top = QRectF(inner.x(), inner.center().y() - lh, inner.width(), lh)
+                    bottom = QRectF(inner.x(), inner.center().y(), inner.width(), lh)
+                    self._draw_label(p, top, Qt.AlignCenter, text, ink, halo)
+                    self._draw_label(p, bottom, Qt.AlignCenter, human(node.size),
+                                     ink_size, halo)
+                else:
+                    self._draw_label(p, inner, Qt.AlignCenter, text, ink, halo)
+
+    @staticmethod
+    def _fit_name(fm, node, name, room):
+        """Elide a name into `room` px. A group label degrades in steps,
+        "▸ 173 smaller items" -> "▸ 173" -> "▸", since an elided middle of
+        it would be noise while the count is the useful part."""
+        if not node.is_group:
+            return fm.elidedText(name, Qt.ElideMiddle, int(room))
+        for text in ("▸ " + name, "▸ " + name.split(" ")[0], "▸"):
+            if fm.horizontalAdvance(text) <= room:
+                return text
+        return ""
+
+
+def list_volumes():
+    """Mounted real filesystems: [(device, mount, fstype, total, used, free)],
+    biggest first. Pseudo filesystems (proc, sys, cgroup, tmpfs...) are left
+    out; anything on a /dev node or a network share is in."""
+    seen = {}
+    try:
+        with open("/proc/mounts", "rb") as f:
+            lines = f.read().split(b"\n")
+    except OSError:
+        return []
+    net = {b"nfs", b"nfs4", b"cifs", b"smb3", b"fuse.sshfs", b"zfs", b"fuse.rclone"}
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        device, mount, fstype = parts[0], _unescape_mount(parts[1]), parts[2]
+        if not (device.startswith(b"/dev/") or fstype in net):
+            continue
+        if fstype in (b"squashfs", b"iso9660", b"udf", b"fuse.gvfsd-fuse"):
+            continue
+        try:
+            st = os.statvfs(mount)
+        except OSError:
+            continue
+        total = st.f_blocks * st.f_frsize
+        if total <= 0:
+            continue
+        free = st.f_bavail * st.f_frsize
+        seen[mount] = (_unescape_mount(device), mount, fstype.decode("ascii", "replace"),
+                       total, total - free, free)    # later lines win
+    return sorted(seen.values(), key=lambda v: v[3], reverse=True)
+
+
+class VolumeCard(QFrame):
+    """One mounted volume: device and mount point, a usage bar, the figures.
+    The whole card is the button."""
+    clicked = Signal(str)
+
+    def __init__(self, device, mount, fstype, total, used, free):
+        super().__init__()
+        self.mount = mount
+        self.setCursor(Qt.PointingHandCursor)
+        self.setObjectName("card")
+        self.setStyleSheet(
+            "#card { background: #2b2d31; border: 1px solid #4a4d55; border-radius: 8px; }"
+            "#card:hover { border-color: #5aa9e6; }"
+        )
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(6)
+        title = QLabel(f"<b>{mount}</b>&nbsp;&nbsp;<span style='color:#a9aeb7'>{device}"
+                       f" &middot; {fstype}</span>")
+        title.setStyleSheet("color: #f0f0f0; font-size: 14px;")
+        title.setTextFormat(Qt.RichText)
+        lay.addWidget(title)
+        bar = QProgressBar()
+        bar.setRange(0, 1000)
+        bar.setValue(int(1000 * used / total) if total else 0)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(10)
+        bar.setStyleSheet(
+            "QProgressBar { background: #1a1b1e; border: none; border-radius: 5px; }"
+            "QProgressBar::chunk { background: #5aa9e6; border-radius: 5px; }"
+        )
+        lay.addWidget(bar)
+        pct = 100.0 * free / total if total else 0.0
+        figures = QLabel(f"{human(used)} used of {human(total)}, "
+                         f"{human(free)} free ({pct:.0f}%)")
+        figures.setStyleSheet("color: #c8c8c8;")
+        lay.addWidget(figures)
 
     def mouseReleaseEvent(self, event):
-        was_drag = self._dragging
-        self._press_pos = None
-        self._drag_origin = None
-        self._dragging = False
-        self.unsetCursor()
-        if not was_drag and event.button() == Qt.LeftButton:
-            self.set_selected(self._node_at(event.position()))
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit(self.mount)
+        super().mouseReleaseEvent(event)
 
-    def mouseDoubleClickEvent(self, event):
-        if event.button() != Qt.LeftButton:
-            return
-        node = self._node_at(event.position())
-        if node is None:
-            return
-        if node is self.focus:
-            self.go_up()
-        elif node.children:
-            self.navigate(node)
 
-    def _context_menu(self, node, global_pos):
-        if node.kind == "disk":
-            node = next((c for c in node.children if c.kind is None), node)
-        if node.synthetic:
-            return
-        menu = QMenu(self)
-        folder = node.path if node.children else os.path.dirname(node.path)
-        act_open = QAction("Open in file manager", self)
-        act_open.triggered.connect(lambda: _open_folder(folder))
-        act_copy = QAction("Copy path", self)
-        act_copy.triggered.connect(
-            lambda: QGuiApplication.clipboard().setText(node.path)
-        )
-        menu.addAction(act_open)
-        menu.addAction(act_copy)
-        menu.exec(global_pos)
+class StartPage(QWidget):
+    """What you see before (or instead of) a tree: the mounted volumes to
+    scan, recent scans, and a way to pick any folder."""
+    scan_requested = Signal(str)
+    browse_requested = Signal()
+    back_requested = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet("background: #1e1f22;")
+        self.setFocusPolicy(Qt.StrongFocus)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        outer.addWidget(scroll)
+        body = QWidget()
+        scroll.setWidget(body)
+        col = QVBoxLayout(body)
+        col.setContentsMargins(0, 28, 0, 28)
+        col.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        self._content = QWidget()
+        self._content.setMaximumWidth(720)
+        col.addWidget(self._content)
+        self._lay = QVBoxLayout(self._content)
+        self._lay.setContentsMargins(24, 0, 24, 0)
+        self._lay.setSpacing(10)
+        self.back_btn = None
+        self.rebuild([], False)
+
+    def rebuild(self, recent, can_go_back):
+        while self._lay.count():
+            item = self._lay.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        heading = QLabel("Scan a volume")
+        heading.setStyleSheet("color: #f0f0f0; font-size: 20px; font-weight: 600;")
+        self._lay.addWidget(heading)
+        volumes = list_volumes()
+        if not volumes:
+            none = QLabel("No mounted volumes found.")
+            none.setStyleSheet("color: #a9aeb7;")
+            self._lay.addWidget(none)
+        for vol in volumes:
+            card = VolumeCard(*vol)
+            card.clicked.connect(self.scan_requested)
+            self._lay.addWidget(card)
+        if recent:
+            self._lay.addSpacing(14)
+            sub = QLabel("Recent")
+            sub.setStyleSheet("color: #f0f0f0; font-size: 16px; font-weight: 600;")
+            self._lay.addWidget(sub)
+            for path in recent:
+                btn = QPushButton(path)
+                btn.setFlat(True)
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setStyleSheet("QPushButton { color: #c8c8c8; text-align: left; padding: 6px 10px; }"
+                                  "QPushButton:hover { color: #ffffff; background: #2b2d31; }")
+                btn.clicked.connect(lambda _=False, p=path: self.scan_requested.emit(p))
+                self._lay.addWidget(btn)
+        self._lay.addSpacing(14)
+        row = QHBoxLayout()
+        browse = QPushButton("Browse for a folder…")
+        browse.setCursor(Qt.PointingHandCursor)
+        browse.clicked.connect(self.browse_requested)
+        row.addWidget(browse)
+        self.back_btn = QPushButton("Back to the scan")
+        self.back_btn.setCursor(Qt.PointingHandCursor)
+        self.back_btn.clicked.connect(self.back_requested)
+        self.back_btn.setVisible(can_go_back)
+        row.addWidget(self.back_btn)
+        row.addStretch()
+        holder = QWidget()
+        holder.setLayout(row)
+        self._lay.addWidget(holder)
 
     def keyPressEvent(self, event):
-        key = event.key()
-        if key == Qt.Key_Escape and self.progress is not None:
-            self.cancel_requested.emit()
-        elif key in (Qt.Key_Backspace, Qt.Key_Escape):
-            self.go_up()
-        elif key in (Qt.Key_0, Qt.Key_Home):
-            self.fit_view(animate=True)
-        elif key in (Qt.Key_Plus, Qt.Key_Equal, Qt.Key_Minus):
-            center = QPointF(self.width() / 2.0, self.height() / 2.0)
-            f = 1.0 / KEY_ZOOM_STEP if key == Qt.Key_Minus else KEY_ZOOM_STEP
-            self._zoom_at(center, f)
+        if event.key() == Qt.Key_Escape and self.back_btn is not None and self.back_btn.isVisible():
+            self.back_requested.emit()
         else:
             super().keyPressEvent(event)
 
@@ -1409,7 +2227,27 @@ def _icon_cube(p, _c):
     p.drawLine(QPointF(20, 16.5), QPointF(12, 21))
 
 
+def _icon_icicle(p, c):
+    p.setBrush(c)
+    p.setPen(Qt.NoPen)
+    p.drawRect(QRectF(3, 3, 5, 18))
+    p.drawRect(QRectF(9.5, 3, 5, 11))
+    p.drawRect(QRectF(9.5, 15.5, 5, 5.5))
+    p.drawRect(QRectF(16, 3, 5, 6))
+    p.drawRect(QRectF(16, 10.5, 5, 3.5))
+
+
+def _icon_boxes(p, _c):
+    p.drawRect(QRectF(3, 3, 18, 18))
+    p.drawLine(QPointF(3, 7.5), QPointF(21, 7.5))
+    p.drawRect(QRectF(5.5, 10, 7, 8.5))
+    p.drawRect(QRectF(14.5, 10, 4, 4))
+    p.drawRect(QRectF(14.5, 15.5, 4, 3))
+
+
 _ICON_PAINTERS = {
+    "icicle": _icon_icicle,
+    "boxes": _icon_boxes,
     "open": _icon_open,
     "rescan": _icon_rescan,
     "fit": _icon_fit,
@@ -1423,9 +2261,9 @@ _ICON_PAINTERS = {
 class Breadcrumb(QWidget):
     """A row of clickable buttons for the path from root to focus."""
 
-    def __init__(self, icicle):
+    def __init__(self, navigate):
         super().__init__()
-        self.icicle = icicle
+        self._navigate = navigate
         self._layout = QHBoxLayout(self)
         self._layout.setContentsMargins(6, 4, 6, 4)
         self._layout.setSpacing(2)
@@ -1447,7 +2285,7 @@ class Breadcrumb(QWidget):
             btn = QPushButton(node.name or "/")
             btn.setFlat(True)
             btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _=False, n=node: self.icicle.navigate(n))
+            btn.clicked.connect(lambda _=False, n=node: self._navigate(n))
             self._layout.addWidget(btn)
             if i < len(chain) - 1:
                 sep = QLabel("›")
@@ -1457,25 +2295,23 @@ class Breadcrumb(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, path, one_fs, scheme=None, style=None):
+    def __init__(self, path, one_fs, scheme=None, style=None, view=None):
         super().__init__()
         self.one_fs = one_fs
         self.settings = QSettings("spacequilt", "spacequilt")
         if scheme is None:
-            scheme = self.settings.value("colors", DEFAULT_SCHEME)
-            if scheme not in COLOR_SCHEMES:
-                scheme = DEFAULT_SCHEME
+            scheme = self._setting("colors", COLOR_SCHEMES, DEFAULT_SCHEME)
         if style is None:
-            style = self.settings.value("style", DEFAULT_STYLE)
-            if style not in STYLES:
-                style = DEFAULT_STYLE
+            style = self._setting("style", STYLES, DEFAULT_STYLE)
+        if view is None:
+            view = self._setting("view", VIEWS, DEFAULT_VIEW)
         self.scanner = None
         self._stopping = []          # scanners still winding down
         self._progress_timer = QTimer(self)
         self._progress_timer.setInterval(100)
         self._progress_timer.timeout.connect(self._poll_progress)
         self._selected = None
-        self._current_path = os.path.abspath(path)
+        self._current_path = os.path.abspath(path) if path else os.path.expanduser("~")
         self.setWindowTitle("spacequilt")
         self.resize(1000, 640)
         geometry = self.settings.value("window/geometry")
@@ -1484,20 +2320,31 @@ class MainWindow(QMainWindow):
             # the position part and place the window themselves.
             self.restoreGeometry(geometry)
 
-        self.icicle = IcicleWidget()
-        self.icicle.set_scheme(scheme)
-        self.icicle.set_bevel(style == "bevel")
-        self.breadcrumb = Breadcrumb(self.icicle)
-        self.icicle.focus_changed.connect(self._on_focus)
-        self.icicle.selection_changed.connect(self._on_selection)
-        self.icicle.cancel_requested.connect(self.cancel_scan)
+        self.views = {"icicle": IcicleWidget(), "boxes": BoxesWidget()}
+        self.stack = QStackedWidget()
+        for name in VIEWS:
+            widget = self.views[name]
+            widget.set_scheme(scheme)
+            widget.set_style(style)
+            widget.focus_changed.connect(self._on_focus)
+            widget.selection_changed.connect(self._on_selection)
+            widget.cancel_requested.connect(self.cancel_scan)
+            self.stack.addWidget(widget)
+        self.view = self.views[view]
+        self.start = StartPage()
+        self.start.scan_requested.connect(self.scan)
+        self.start.browse_requested.connect(self._pick_dir)
+        self.start.back_requested.connect(self._leave_start)
+        self.stack.addWidget(self.start)
+        self.stack.setCurrentWidget(self.view)
+        self.breadcrumb = Breadcrumb(lambda n: self.view.navigate(n))
 
         central = QWidget()
         v = QVBoxLayout(central)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
         v.addWidget(self.breadcrumb)
-        v.addWidget(self.icicle, 1)
+        v.addWidget(self.stack, 1)
         self.setCentralWidget(central)
 
         tb = self.addToolBar("main")
@@ -1505,7 +2352,8 @@ class MainWindow(QMainWindow):
         tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         act_open = QAction(self._icon("open"), "Open…", self)
         act_open.setShortcut("Ctrl+O")
-        act_open.triggered.connect(self._pick_dir)
+        act_open.setToolTip("Pick a volume, a recent scan or any folder (Ctrl+O)")
+        act_open.triggered.connect(self.show_start)
         act_rescan = QAction(self._icon("rescan"), "Rescan", self)
         act_rescan.setShortcut("Ctrl+R")
         act_rescan.triggered.connect(self._rescan)
@@ -1530,14 +2378,24 @@ class MainWindow(QMainWindow):
         act_fit.setShortcut("Ctrl+0")
         act_fit.setToolTip("Reset zoom and pan to fit the current focus")
         act_fit.triggered.connect(
-            lambda _checked=False: self.icicle.fit_view(animate=True)
+            lambda _checked=False: self.view.fit_view(animate=True)
         )
-        self.act_bevel = QAction(self._icon("cube"), "3D", self)
-        self.act_bevel.setCheckable(True)
-        self.act_bevel.setChecked(style == "bevel")
-        self.act_bevel.setToolTip("Raised blocks: light top/left edge, dark "
-                                  "bottom/right edge and a soft gradient")
-        self.act_bevel.toggled.connect(self._set_bevel)
+        view_group = QActionGroup(self)
+        view_group.setExclusive(True)
+        self.view_actions = {}
+        for name, text, tip, key in (
+            ("icicle", "Icicle", "Columns per depth, sized by bytes", "Ctrl+1"),
+            ("boxes", "Boxes", "Nested titled boxes, SpaceMonger style", "Ctrl+2"),
+        ):
+            act = QAction(self._icon(name), text, self)
+            act.setCheckable(True)
+            act.setChecked(name == view)
+            act.setToolTip(f"{tip} ({key})")
+            act.setShortcut(key)
+            act.setData(name)
+            view_group.addAction(act)
+            self.view_actions[name] = act
+        view_group.triggered.connect(lambda act: self.set_view(act.data()))
         tb.addAction(act_open)
         tb.addAction(act_rescan)
         tb.addAction(self.act_stop)
@@ -1545,64 +2403,128 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self.act_one_fs)
         tb.addSeparator()
-        tb.addWidget(self._colors_button(scheme))
-        tb.addAction(self.act_bevel)
+        for name in VIEWS:
+            tb.addAction(self.view_actions[name])
+        tb.addSeparator()
+        tb.addWidget(self._menu_button(
+            "Colors", "colors", "Colour scheme of the blocks",
+            (("branches", "Branches", "One hue per top-level entry, lighter with depth"),
+             ("levels", "Levels", "One colour per depth, cycling"),
+             ("rainbow", "Rainbow", "Every level re-spreads the hues; the first "
+                                    "child keeps its parent's")),
+            scheme, self._set_scheme,
+        ))
+        tb.addWidget(self._menu_button(
+            "Style", "cube", "Relief of the blocks",
+            (("flat", "Flat", "Plain fills and thin outlines"),
+             ("raised", "Raised", "Light top/left edge, dark bottom/right edge, "
+                                  "soft gradient, sunken content areas"),
+             ("deep", "Deep", "The same relief, twice as strong")),
+            style, self._set_style,
+        ))
 
         self.statusBar().showMessage("Ready.")
-        self.scan(path)
+        if path:
+            self.scan(path)
+        else:
+            self.show_start()
+
+    def _setting(self, key, allowed, default):
+        """A remembered choice, with old value names mapped to current ones."""
+        value = self.settings.value(key, default)
+        value = LEGACY_VALUES.get(value, value)
+        return value if value in allowed else default
 
     def _icon(self, kind):
         return make_icon(kind, self.palette().buttonText().color())
 
-    def _set_bevel(self, on):
-        self.icicle.set_bevel(on)
-        self.settings.setValue("style", "bevel" if on else "flat")
+    def _set_style(self, style):
+        for widget in self.views.values():
+            widget.set_style(style)
+        self.settings.setValue("style", style)
 
-    def _colors_button(self, current):
-        labels = {
-            "classic": ("Classic", "One hue per top-level entry, lighter with depth"),
-            "spacemonger": ("SpaceMonger", "Fixed pastel palette cycling by depth"),
-            "rainbow": ("Rainbow", "Every level re-spreads the hues; the first "
-                                   "child keeps its parent's"),
-        }
+    def show_start(self):
+        """The volumes / recent / browse page, over whatever is shown."""
+        recent = self.settings.value("recent", [])
+        if isinstance(recent, str):
+            recent = [recent]
+        self.start.rebuild(list(recent or []), self.view.focus is not None)
+        self.stack.setCurrentWidget(self.start)
+        self.start.setFocus()
+
+    def _leave_start(self):
+        self.stack.setCurrentWidget(self.view)
+        self.view.setFocus()
+
+    def _remember_recent(self, path):
+        recent = self.settings.value("recent", [])
+        if isinstance(recent, str):
+            recent = [recent]
+        recent = [path] + [p for p in (recent or []) if p != path]
+        self.settings.setValue("recent", recent[:8])
+
+    def set_view(self, name):
+        """Switch the visible view; it adopts the current focus (no animation)."""
+        new = self.views[name]
+        if new is self.view:
+            if self.stack.currentWidget() is not new:
+                self._leave_start()
+            return
+        old, self.view = self.view, new
+        if old.focus is not None and new.focus is not old.focus:
+            new.set_focus(old.focus)
+        new.set_selected(None)
+        if self.stack.currentWidget() is not self.start:
+            self.stack.setCurrentWidget(new)
+            new.setFocus()
+        self.view_actions[name].setChecked(True)
+        self.settings.setValue("view", name)
+        self._on_focus(new.focus)
+
+    def _menu_button(self, title, icon, tip, options, current, handler):
+        """Toolbar button with an exclusive menu; `handler` gets the chosen id."""
         menu = QMenu(self)
         group = QActionGroup(self)
         group.setExclusive(True)
-        for scheme in COLOR_SCHEMES:
-            text, tip = labels[scheme]
+        for value, text, item_tip in options:
             act = QAction(text, self)
             act.setCheckable(True)
-            act.setChecked(scheme == current)
-            act.setToolTip(tip)
-            act.setData(scheme)
+            act.setChecked(value == current)
+            act.setToolTip(item_tip)
+            act.setData(value)
             group.addAction(act)
             menu.addAction(act)
-        group.triggered.connect(self._set_scheme)
+        group.triggered.connect(lambda act: handler(act.data()))
         btn = QToolButton(self)
-        btn.setText("Colors")
-        btn.setIcon(self._icon("colors"))
+        btn.setText(title)
+        btn.setIcon(self._icon(icon))
         btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        btn.setToolTip("Colour scheme of the blocks")
+        btn.setToolTip(tip)
         btn.setMenu(menu)
         btn.setPopupMode(QToolButton.InstantPopup)
         return btn
 
-    def _set_scheme(self, action):
-        scheme = action.data()
-        self.icicle.set_scheme(scheme)
+    def _set_scheme(self, scheme):
+        for widget in self.views.values():
+            widget.set_scheme(scheme)
         self.settings.setValue("colors", scheme)
 
     def _on_focus(self, node):
+        sender = self.sender()
+        if sender is not None and sender is not self.view:
+            return          # the hidden view echoing set_focus()
         self.breadcrumb.rebuild(node)
         self._selected = None
         self._update_status()
 
     def _on_selection(self, node):
+        if self.sender() is not self.view:
+            return
         self._selected = node
         self._update_status()
 
     def _update_status(self):
-        node = self._selected or self.icicle.focus
+        node = self._selected or self.view.focus
         if node is None:
             return
         if node.kind == "disk":
@@ -1621,6 +2543,7 @@ class MainWindow(QMainWindow):
         # on top of this one.
         self.stop_scan()
         self._current_path = path
+        self._leave_start()
         self.setWindowTitle(f"{path} - spacequilt")
         self.statusBar().showMessage(f"Scanning {path} …")
         self.act_stop.setEnabled(True)
@@ -1644,9 +2567,8 @@ class MainWindow(QMainWindow):
         if self.scanner is None:
             return
         entries, target, current, secs = self.scanner.progress()
-        self.icicle.set_progress(
-            (self._current_path, entries, target, current, secs)
-        )
+        for widget in self.views.values():
+            widget.set_progress((self._current_path, entries, target, current, secs))
         if target:
             pct = min(99, int(100 * entries / target))
             self.statusBar().showMessage(
@@ -1660,7 +2582,8 @@ class MainWindow(QMainWindow):
     def _end_progress(self):
         self._progress_timer.stop()
         self.act_stop.setEnabled(False)
-        self.icicle.set_progress(None)
+        for widget in self.views.values():
+            widget.set_progress(None)
 
     def cancel_scan(self):
         """Abort the running scan; whatever was on screen before stays."""
@@ -1668,10 +2591,11 @@ class MainWindow(QMainWindow):
             return
         self.stop_scan()
         self._end_progress()
-        self.icicle.empty_text = (
-            "Scan cancelled.  Ctrl+R rescans, Ctrl+O opens another directory."
-        )
-        self.icicle.update()
+        for widget in self.views.values():
+            widget.empty_text = (
+                "Scan cancelled.  Ctrl+R rescans, Ctrl+O opens another directory."
+            )
+            widget.update()
         self.statusBar().showMessage(f"Scan of {self._current_path} cancelled.")
 
     def _on_scan_done(self, root, scanner):
@@ -1683,7 +2607,9 @@ class MainWindow(QMainWindow):
                 self._entries_key(scanner.path), scanner.builder.count()
             )
         self._end_progress()
-        self.icicle.set_root(root)
+        self._remember_recent(scanner.path)
+        for widget in self.views.values():
+            widget.set_root(root)
         self._update_status()
 
     def _on_scan_failed(self, msg, scanner):
@@ -1779,7 +2705,10 @@ def main():
     parser = argparse.ArgumentParser(
         prog="spacequilt", description="Icicle disk-usage viewer."
     )
-    parser.add_argument("path", nargs="?", default=".", help="Directory to scan.")
+    parser.add_argument(
+        "path", nargs="?", default=None,
+        help="Directory to scan. Without it the volumes page opens.",
+    )
     parser.add_argument(
         "-x",
         "--one-filesystem",
@@ -1803,11 +2732,18 @@ def main():
              "Without it the last choice from the toolbar is used.",
     )
     parser.add_argument(
+        "--view",
+        choices=VIEWS,
+        default=None,
+        help="Start in this view: icicle columns or SpaceMonger-style nested "
+             "boxes (also remembered as the new default).",
+    )
+    parser.add_argument(
         "--style",
         choices=STYLES,
         default=None,
-        help="Block style for this run: flat, or bevel for raised 3D-ish "
-             "tiles (also remembered as the new default).",
+        help="Relief of the blocks for this run: flat, raised or deep (also "
+             "remembered as the new default).",
     )
     args = parser.parse_args()
 
@@ -1818,11 +2754,13 @@ def main():
     app.setDesktopFileName("spacequilt")
     if os.path.exists(ICON_PATH):
         app.setWindowIcon(QIcon(ICON_PATH))
-    win = MainWindow(args.path, args.one_filesystem, args.colors, args.style)
+    win = MainWindow(args.path, args.one_filesystem, args.colors, args.style, args.view)
     if args.colors:
         win.settings.setValue("colors", args.colors)
     if args.style:
         win.settings.setValue("style", args.style)
+    if args.view:
+        win.settings.setValue("view", args.view)
     _sigint_timer = _install_signal_handlers(app, win)   # noqa: F841 (keep alive)
     win.show()
     sys.exit(app.exec())
