@@ -1,6 +1,6 @@
 # SpaceQuilt
 
-SpaceQuilt shows disk usage in two views that no current Linux tool offers:
+SpaceQuilt shows disk usage in two views:
 
 - **Boxes**, after SpaceMonger: each directory is a titled box, with its
   children packed inside it, down to the files. You see a whole volume as one
