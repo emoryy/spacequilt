@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <rect width="128" height="128" rx="26" fill="#1e1f22"/>
+  <!-- Icicle columns: neutral root, one hue per child, lighter with depth. -->
+  <g>
+    <rect x="18" y="20" width="28" height="88" rx="2" fill="#6f6a75"/>
+
+    <rect x="50" y="20" width="28" height="45" rx="2" fill="#d4564e"/>
+    <rect x="50" y="68" width="28" height="25" rx="2" fill="#4f9e46"/>
+    <rect x="50" y="96" width="28" height="12" rx="2" fill="#4a86c8"/>
+
+    <rect x="82" y="20" width="28" height="26" rx="2" fill="#e4796f"/>
+    <rect x="82" y="49" width="28" height="16" rx="2" fill="#ee9c8f"/>
+    <rect x="82" y="68" width="28" height="25" rx="2" fill="#6fb862"/>
+    <rect x="82" y="96" width="28" height="12" rx="2" fill="#6fa3dc"/>
+  </g>
+</svg>
