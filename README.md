@@ -1,4 +1,4 @@
-# spacequilt
+# SpaceQuilt
 
 A modern, minimal disk-usage viewer with two classic visualisations that
 nothing on Linux carries forward today:
@@ -89,7 +89,7 @@ Installs a `.desktop` entry and symlinks `spacequilt.svg` into the icon theme,
 both pointing back at this checkout. Wayland compositors resolve a window's
 icon through its desktop id rather than from the window itself, so without the
 entry the task bar falls back to a generic placeholder. The entry also
-registers `inode/directory`, so folders get a *Open with spacequilt* action.
+registers `inode/directory`, so folders get a *Open with SpaceQuilt* action.
 
 ### Interaction
 

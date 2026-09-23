@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Register spacequilt with the desktop: a .desktop entry plus the icon, both
+# Register SpaceQuilt with the desktop: a .desktop entry plus the icon, both
 # pointing back at this checkout. Wayland compositors look the window icon up
 # by desktop id (set with QGuiApplication::setDesktopFileName), so the entry is
 # what makes the icon show up in the task bar and the launcher.
@@ -32,14 +32,14 @@ ln -sfn "$here/spacequilt.svg" "$icon"
 cat > "$entry" <<EOF
 [Desktop Entry]
 Type=Application
-Name=spacequilt
+Name=SpaceQuilt
 GenericName=Disk usage viewer
-Comment=Icicle disk-usage view built on du
+Comment=Disk usage as icicle columns or a nested box map, built on du
 Exec="$here/spacequilt" %f
 Icon=spacequilt
 Terminal=false
 Categories=Utility;Filesystem;
-Keywords=disk;usage;space;du;icicle;
+Keywords=disk;usage;space;du;icicle;treemap;
 MimeType=inode/directory;
 StartupWMClass=spacequilt
 EOF

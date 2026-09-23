@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""spacequilt - a modern take on xdiskusage's icicle disk-usage view.
+"""SpaceQuilt - disk usage as icicle columns or a SpaceMonger-style nested map.
 
 Scans a directory with `du` (exactly the trick the original xdiskusage uses)
 and draws the result as horizontal, size-proportional columns. Click a block
@@ -2312,7 +2312,7 @@ class MainWindow(QMainWindow):
         self._progress_timer.timeout.connect(self._poll_progress)
         self._selected = None
         self._current_path = os.path.abspath(path) if path else os.path.expanduser("~")
-        self.setWindowTitle("spacequilt")
+        self.setWindowTitle("SpaceQuilt")
         self.resize(1000, 640)
         geometry = self.settings.value("window/geometry")
         if geometry is not None:
@@ -2537,14 +2537,14 @@ class MainWindow(QMainWindow):
     def scan(self, path):
         path = os.path.abspath(path)
         if not os.path.isdir(path):
-            QMessageBox.warning(self, "spacequilt", f"Not a directory:\n{path}")
+            QMessageBox.warning(self, "SpaceQuilt", f"Not a directory:\n{path}")
             return
         # A scan still running would keep burning IO and could land its result
         # on top of this one.
         self.stop_scan()
         self._current_path = path
         self._leave_start()
-        self.setWindowTitle(f"{path} - spacequilt")
+        self.setWindowTitle(f"{path} - SpaceQuilt")
         self.statusBar().showMessage(f"Scanning {path} …")
         self.act_stop.setEnabled(True)
         expected = self.settings.value(self._entries_key(path), None)
@@ -2616,7 +2616,7 @@ class MainWindow(QMainWindow):
         if scanner is not self.scanner:
             return
         self._end_progress()
-        QMessageBox.critical(self, "spacequilt", f"Scan failed:\n{msg}")
+        QMessageBox.critical(self, "SpaceQuilt", f"Scan failed:\n{msg}")
         self.statusBar().showMessage("Scan failed.")
 
     def stop_scan(self, timeout_ms=2000):
@@ -2703,7 +2703,7 @@ def _install_signal_handlers(app, win):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="spacequilt", description="Icicle disk-usage viewer."
+        prog="spacequilt", description="Disk-usage viewer: icicle columns or nested boxes."
     )
     parser.add_argument(
         "path", nargs="?", default=None,
@@ -2748,7 +2748,7 @@ def main():
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
-    app.setApplicationName("spacequilt")
+    app.setApplicationName("SpaceQuilt")
     # Wayland shows the icon the compositor finds for this desktop id, so both
     # the id and the window icon have to be set for it to appear everywhere.
     app.setDesktopFileName("spacequilt")
