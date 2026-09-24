@@ -54,8 +54,6 @@ import tempfile
 import time
 import zlib
 
-os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
-
 from PySide6.QtCore import (
     QEasingCurve,
     QPointF,
