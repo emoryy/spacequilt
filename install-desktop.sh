@@ -16,6 +16,10 @@ refresh() {
     update-desktop-database "$data/applications" 2>/dev/null || true
     gtk-update-icon-cache -qtf "$data/icons/hicolor" 2>/dev/null || true
     kbuildsycoca6 --noincremental 2>/dev/null || true
+    # A running plasmashell keeps serving icons from its cache and shows a new
+    # launcher without one until told to reload.
+    dbus-send --session --type=signal /KIconLoader \
+        org.kde.KIconLoader.iconChanged int32:0 2>/dev/null || true
 }
 
 if [[ "${1:-}" == "--uninstall" ]]; then
